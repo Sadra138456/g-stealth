@@ -14,6 +14,7 @@ import (
 	"log"
 	"math/big"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -27,22 +28,11 @@ const (
 	AuthToken      = "ef92b778ba715867219a6"
 )
 
-type streamWrapper struct {
-	quic.Stream
-}
-
-func (s *streamWrapper) Read(p []byte) (n int, err error) {
-	return s.Stream.Read(p)
-}
-
-func (s *streamWrapper) Write(p []byte) (n int, err error) {
-	return s.Stream.Write(p)
-}
-
 type Peer struct {
 	remoteAddr string
 	conn       quic.Connection
 	streams    chan quic.Stream
+	mu         sync.Mutex
 }
 
 func main() {
@@ -88,13 +78,13 @@ func runServer(listenAddr string) {
 				if err != nil {
 					return
 				}
-				go handleStealthStream(&streamWrapper{stream})
+				go handleStealthStream(stream)
 			}
 		}(qConn)
 	}
 }
 
-func handleStealthStream(stream io.ReadWriteCloser) {
+func handleStealthStream(stream quic.Stream) {
 	defer stream.Close()
 
 	// بررسی AuthToken
@@ -196,7 +186,11 @@ func runClient(remoteAddr, localProxy string) {
 
 func (p *Peer) maintainConnection() {
 	for {
-		if p.conn == nil || p.conn.Context().Err() != nil {
+		p.mu.Lock()
+		needReconnect := p.conn == nil || p.conn.Context().Err() != nil
+		p.mu.Unlock()
+
+		if needReconnect {
 			tlsConf := &tls.Config{
 				InsecureSkipVerify: true,
 				NextProtos:         []string{ProtocolALPN},
@@ -209,7 +203,10 @@ func (p *Peer) maintainConnection() {
 				continue
 			}
 
+			p.mu.Lock()
 			p.conn = conn
+			p.mu.Unlock()
+
 			log.Println("QUIC connection established")
 
 			// پر کردن استریم‌ها
@@ -277,10 +274,16 @@ func (p *Peer) shredderForward(localConn net.Conn, targetAddr string) {
 
 	// پر کردن مجدد استریم
 	go func() {
-		s, err := p.conn.OpenStream()
-		if err == nil {
-			s.Write([]byte(AuthToken))
-			p.streams <- s
+		p.mu.Lock()
+		conn := p.conn
+		p.mu.Unlock()
+
+		if conn != nil {
+			s, err := conn.OpenStream()
+			if err == nil {
+				s.Write([]byte(AuthToken))
+				p.streams <- s
+			}
 		}
 	}()
 
@@ -299,14 +302,13 @@ func (p *Peer) shredderForward(localConn net.Conn, targetAddr string) {
 	// QUIC → TCP
 	go func() {
 		defer func() { done <- struct{}{} }()
-		io.Copy(localConn, &streamWrapper{stream})
+		io.Copy(localConn, stream)
 	}()
 
 	// TCP → QUIC
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, MaxChunkSize)
-		sw := &streamWrapper{stream}
 		for {
 			n, err := localConn.Read(buf)
 			if err != nil {
@@ -321,9 +323,9 @@ func (p *Peer) shredderForward(localConn net.Conn, targetAddr string) {
 			binary.BigEndian.PutUint16(header[:2], uint16(n))
 			header[2] = junkLen
 
-			sw.Write(header)
-			sw.Write(buf[:n])
-			sw.Write(junk)
+			stream.Write(header)
+			stream.Write(buf[:n])
+			stream.Write(junk)
 		}
 	}()
 
