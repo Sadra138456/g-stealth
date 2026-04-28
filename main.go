@@ -6,8 +6,8 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
-	"encoding/pem"
 	"flag"
 	"fmt"
 	"io"
@@ -21,32 +21,39 @@ import (
 
 const (
 	StreamPoolSize = 20
-	MaxChunkSize   = 16384
+	MaxChunkSize   = 800
 	ProtocolALPN   = "h3"
 	SNI            = "www.google.com"
-	AuthToken      = "MySecretToken123"
+	AuthToken      = "ef92b778ba715867219a6"
 )
 
+type Peer struct {
+	remoteAddr string
+	conn       quic.Connection
+	streams    chan quic.Stream
+}
+
 func main() {
-	mode := flag.String("mode", "server", "server or client")
-	listenAddr := flag.String("listen", ":443", "listen address")
-	remoteAddr := flag.String("remote", "", "remote QUIC server address")
-	forwardAddr := flag.String("forward", "127.0.0.1:80", "forward address (server mode)")
-	localProxy := flag.String("local", "127.0.0.1:1080", "local SOCKS5 proxy address (client mode)")
+	mode := flag.String("mode", "client", "server or client")
+	remoteAddr := flag.String("remote", "185.208.172.162:443", "remote server address")
+	listenAddr := flag.String("listen", "0.0.0.0:443", "listen address (server mode)")
+	localProxy := flag.String("proxy", "127.0.0.1:1080", "local SOCKS5 proxy address (client mode)")
 
 	flag.Parse()
 
 	if *mode == "server" {
-		runServer(*listenAddr, *forwardAddr)
+		log.Println("Starting server on", *listenAddr)
+		runServer(*listenAddr)
 	} else {
-		if *remoteAddr == "" {
-			log.Fatal("remote address required in client mode")
-		}
-		runClient(*localProxy, *remoteAddr)
+		log.Println("Starting client, connecting to", *remoteAddr)
+		log.Println("SOCKS5 proxy listening on", *localProxy)
+		runClient(*remoteAddr, *localProxy)
 	}
 }
 
-func runServer(listenAddr, forwardAddr string) {
+// ========== SERVER ==========
+
+func runServer(listenAddr string) {
 	tlsConf := generateTLSConfig()
 	listener, err := quic.ListenAddr(listenAddr, tlsConf, nil)
 	if err != nil {
@@ -54,7 +61,7 @@ func runServer(listenAddr, forwardAddr string) {
 	}
 	defer listener.Close()
 
-	log.Printf("Server listening on %s, forwarding to %s", listenAddr, forwardAddr)
+	log.Println("QUIC server listening...")
 
 	for {
 		qConn, err := listener.Accept(context.Background())
@@ -62,178 +69,255 @@ func runServer(listenAddr, forwardAddr string) {
 			log.Println("Accept error:", err)
 			continue
 		}
-		go handleConnection(qConn, forwardAddr)
+
+		go func(conn quic.Connection) {
+			for {
+				stream, err := conn.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+				go handleStealthStream(stream)
+			}
+		}(qConn)
 	}
 }
 
-func handleConnection(qConn quic.Connection, forwardAddr string) {
-	defer qConn.CloseWithError(0, "done")
-
-	for {
-		stream, err := qConn.AcceptStream(context.Background())
-		if err != nil {
-			return
-		}
-		go handleStream(stream, forwardAddr)
-	}
-}
-
-func handleStream(stream quic.Stream, forwardAddr string) {
+func handleStealthStream(stream quic.Stream) {
 	defer stream.Close()
 
-	authBuf := make([]byte, len(AuthToken))
-	if _, err := io.ReadFull(stream, authBuf); err != nil {
-		return
-	}
-	if string(authBuf) != AuthToken {
+	// بررسی AuthToken
+	tokenBuf := make([]byte, len(AuthToken))
+	if _, err := io.ReadFull(stream, tokenBuf); err != nil || string(tokenBuf) != AuthToken {
 		return
 	}
 
-	tcpConn, err := net.DialTimeout("tcp", forwardAddr, 5*time.Second)
+	// خواندن آدرس هدف
+	addrLenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(stream, addrLenBuf); err != nil {
+		return
+	}
+	addrLen := binary.BigEndian.Uint16(addrLenBuf)
+
+	addrBuf := make([]byte, addrLen)
+	if _, err := io.ReadFull(stream, addrBuf); err != nil {
+		return
+	}
+	forwardAddr := string(addrBuf)
+
+	// اتصال به هدف نهایی
+	target, err := net.Dial("tcp", forwardAddr)
 	if err != nil {
 		return
 	}
-	defer tcpConn.Close()
+	defer target.Close()
 
-	go io.Copy(stream, tcpConn)
-	
-	for {
-		header := make([]byte, 3)
-		if _, err := io.ReadFull(stream, header); err != nil {
-			return
+	// رله دوطرفه
+	done := make(chan struct{}, 2)
+
+	// QUIC → TCP
+	go func() {
+		defer func() { done <- struct{}{} }()
+		for {
+			header := make([]byte, 3)
+			if _, err := io.ReadFull(stream, header); err != nil {
+				return
+			}
+
+			payloadLen := binary.BigEndian.Uint16(header[:2])
+			junkLen := header[2]
+
+			totalLen := int(payloadLen) + int(junkLen)
+			buf := make([]byte, totalLen)
+			if _, err := io.ReadFull(stream, buf); err != nil {
+				return
+			}
+
+			if _, err := target.Write(buf[:payloadLen]); err != nil {
+				return
+			}
 		}
+	}()
 
-		payloadLen := binary.BigEndian.Uint16(header[:2])
-		junkLen := header[2]
-		totalLen := int(payloadLen) + int(junkLen)
+	// TCP → QUIC
+	go func() {
+		defer func() { done <- struct{}{} }()
+		io.Copy(stream, target)
+	}()
 
-		buf := make([]byte, totalLen)
-		if _, err := io.ReadFull(stream, buf); err != nil {
-			return
-		}
-
-		if _, err := tcpConn.Write(buf[:payloadLen]); err != nil {
-			return
-		}
-	}
+	<-done
 }
 
-func runClient(localProxy, remoteAddr string) {
+// ========== CLIENT ==========
+
+func runClient(remoteAddr, localProxy string) {
+	p := &Peer{
+		remoteAddr: remoteAddr,
+		streams:    make(chan quic.Stream, StreamPoolSize),
+	}
+
+	go p.maintainConnection()
+
 	listener, err := net.Listen("tcp", localProxy)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer listener.Close()
 
-	log.Printf("SOCKS5 proxy listening on %s, tunneling to %s", localProxy, remoteAddr)
+	log.Println("SOCKS5 proxy ready on", localProxy)
 
 	for {
-		conn, err := listener.Accept()
+		c, err := listener.Accept()
 		if err != nil {
-			log.Println("Accept error:", err)
 			continue
 		}
-		go handleSOCKS5(conn, remoteAddr)
+
+		go func(conn net.Conn) {
+			targetAddr, err := handleSOCKS5(conn)
+			if err != nil {
+				conn.Close()
+				return
+			}
+			p.shredderForward(conn, targetAddr)
+		}(c)
 	}
 }
 
-func handleSOCKS5(conn net.Conn, remoteAddr string) {
-	defer conn.Close()
-
-	// SOCKS5 handshake
-	buf := make([]byte, 256)
-	n, err := conn.Read(buf)
-	if err != nil || n < 2 || buf[0] != 0x05 {
-		return
-	}
-
-	// No authentication
-	conn.Write([]byte{0x05, 0x00})
-
-	// Read request
-	n, err = conn.Read(buf)
-	if err != nil || n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
-		return
-	}
-
-	// Parse target address
-	var targetAddr string
-	switch buf[3] {
-	case 0x01: // IPv4
-		targetAddr = fmt.Sprintf("%d.%d.%d.%d:%d",
-			buf[4], buf[5], buf[6], buf[7],
-			binary.BigEndian.Uint16(buf[8:10]))
-	case 0x03: // Domain
-		domainLen := int(buf[4])
-		targetAddr = fmt.Sprintf("%s:%d",
-			string(buf[5:5+domainLen]),
-			binary.BigEndian.Uint16(buf[5+domainLen:7+domainLen]))
-	case 0x04: // IPv6
-		return // Not implemented
-	default:
-		return
-	}
-
-	// Connect via QUIC tunnel
-	tlsConf := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{ProtocolALPN},
-		ServerName:         SNI,
-	}
-
-	qConn, err := quic.DialAddr(context.Background(), remoteAddr, tlsConf, nil)
-	if err != nil {
-		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer qConn.CloseWithError(0, "done")
-
-	stream, err := qConn.OpenStream()
-	if err != nil {
-		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer stream.Close()
-
-	// Send auth token
-	stream.Write([]byte(AuthToken))
-
-	// Send target address to server (new feature)
-	targetBytes := []byte(targetAddr)
-	lenBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBuf, uint16(len(targetBytes)))
-	stream.Write(lenBuf)
-	stream.Write(targetBytes)
-
-	// SOCKS5 success response
-	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-
-	// Relay data
-	go io.Copy(conn, stream)
-	relayToQUIC(conn, stream)
-}
-
-func relayToQUIC(src net.Conn, dst quic.Stream) {
-	buf := make([]byte, MaxChunkSize)
+func (p *Peer) maintainConnection() {
 	for {
-		n, err := src.Read(buf)
-		if err != nil {
-			return
+		if p.conn == nil || p.conn.Context().Err() != nil {
+			tlsConf := &tls.Config{
+				InsecureSkipVerify: true,
+				NextProtos:         []string{ProtocolALPN},
+				ServerName:         SNI,
+			}
+
+			conn, err := quic.DialAddr(context.Background(), p.remoteAddr, tlsConf, nil)
+			if err != nil {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			p.conn = conn
+			log.Println("QUIC connection established")
+
+			// پر کردن استریم‌ها
+			for i := 0; i < StreamPoolSize; i++ {
+				s, err := conn.OpenStream()
+				if err != nil {
+					break
+				}
+				s.Write([]byte(AuthToken))
+				p.streams <- s
+			}
 		}
 
-		junkLen := byte(rand.Intn(64))
-		header := make([]byte, 3)
-		binary.BigEndian.PutUint16(header[:2], uint16(n))
-		header[2] = junkLen
-
-		junk := make([]byte, junkLen)
-		rand.Read(junk)
-
-		dst.Write(header)
-		dst.Write(buf[:n])
-		dst.Write(junk)
+		time.Sleep(5 * time.Second)
 	}
 }
+
+func handleSOCKS5(localConn net.Conn) (string, error) {
+	buf := make([]byte, 512)
+
+	// خواندن greeting
+	n, err := localConn.Read(buf)
+	if err != nil || n < 2 || buf[0] != 0x05 {
+		return "", fmt.Errorf("invalid SOCKS5 greeting")
+	}
+
+	// پاسخ: no auth
+	localConn.Write([]byte{0x05, 0x00})
+
+	// خواندن request
+	n, err = localConn.Read(buf)
+	if err != nil || n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
+		return "", fmt.Errorf("invalid SOCKS5 request")
+	}
+
+	// پارس آدرس
+	var host string
+	var port uint16
+
+	switch buf[3] {
+	case 0x01: // IPv4
+		host = net.IP(buf[4:8]).String()
+		port = binary.BigEndian.Uint16(buf[8:10])
+	case 0x03: // Domain
+		domainLen := int(buf[4])
+		host = string(buf[5 : 5+domainLen])
+		port = binary.BigEndian.Uint16(buf[5+domainLen : 7+domainLen])
+	case 0x04: // IPv6
+		host = net.IP(buf[4:20]).String()
+		port = binary.BigEndian.Uint16(buf[20:22])
+	default:
+		return "", fmt.Errorf("unsupported address type")
+	}
+
+	// پاسخ موفقیت
+	localConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+
+	return fmt.Sprintf("%s:%d", host, port), nil
+}
+
+func (p *Peer) shredderForward(localConn net.Conn, targetAddr string) {
+	defer localConn.Close()
+
+	stream := <-p.streams
+
+	// پر کردن مجدد استریم
+	go func() {
+		s, err := p.conn.OpenStream()
+		if err == nil {
+			s.Write([]byte(AuthToken))
+			p.streams <- s
+		}
+	}()
+
+	defer stream.Close()
+
+	// ارسال آدرس هدف
+	addrBytes := []byte(targetAddr)
+	addrHeader := make([]byte, 2)
+	binary.BigEndian.PutUint16(addrHeader, uint16(len(addrBytes)))
+	stream.Write(addrHeader)
+	stream.Write(addrBytes)
+
+	// رله دوطرفه
+	done := make(chan struct{}, 2)
+
+	// QUIC → TCP
+	go func() {
+		defer func() { done <- struct{}{} }()
+		io.Copy(localConn, stream)
+	}()
+
+	// TCP → QUIC
+	go func() {
+		defer func() { done <- struct{}{} }()
+		buf := make([]byte, MaxChunkSize)
+		for {
+			n, err := localConn.Read(buf)
+			if err != nil {
+				return
+			}
+
+			junkLen := byte(10 + (n % 50))
+			junk := make([]byte, junkLen)
+			rand.Read(junk)
+
+			header := make([]byte, 3)
+			binary.BigEndian.PutUint16(header[:2], uint16(n))
+			header[2] = junkLen
+
+			stream.Write(header)
+			stream.Write(buf[:n])
+			stream.Write(junk)
+		}
+	}()
+
+	<-done
+}
+
+// ========== TLS ==========
 
 func generateTLSConfig() *tls.Config {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -243,8 +327,15 @@ func generateTLSConfig() *tls.Config {
 
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		Subject: pkix.Name{
+			Organization: []string{"Acme Co"},
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
@@ -252,16 +343,13 @@ func generateTLSConfig() *tls.Config {
 		log.Fatal(err)
 	}
 
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	return &tls.Config{
-		Certificates: []tls.Certificate{tlsCert},
-		NextProtos:   []string{ProtocolALPN},
+		Certificates: []tls.Certificate{
+			{
+				Certificate: [][]byte{certDER},
+				PrivateKey:  key,
+			},
+		},
+		NextProtos: []string{ProtocolALPN},
 	}
 }
