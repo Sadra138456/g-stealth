@@ -14,7 +14,6 @@ import (
 	"log"
 	"math/big"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -22,226 +21,247 @@ import (
 
 const (
 	StreamPoolSize = 20
-	MaxChunkSize   = 800
+	MaxChunkSize   = 16384
 	ProtocolALPN   = "h3"
 	SNI            = "www.google.com"
-	AuthToken      = "MySecretToken123" // حتما این را تغییر دهید
+	AuthToken      = "MySecretToken123"
 )
-
-var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, MaxChunkSize+100)
-	},
-}
 
 func main() {
 	mode := flag.String("mode", "server", "server or client")
-	remoteAddr := flag.String("remote", "127.0.0.1:443", "Server address")
-	listenAddr := flag.String("listen", "0.0.0.0:443", "Listen address")
-	forwardAddr := flag.String("forward", "127.0.0.1:8080", "X-UI/Upstream port")
-	localProxy := flag.String("proxy", "127.0.0.1:10808", "Local port")
+	listenAddr := flag.String("listen", ":443", "listen address")
+	remoteAddr := flag.String("remote", "", "remote QUIC server address")
+	forwardAddr := flag.String("forward", "127.0.0.1:80", "forward address (server mode)")
+	localProxy := flag.String("local", "127.0.0.1:1080", "local SOCKS5 proxy address (client mode)")
+
 	flag.Parse()
 
 	if *mode == "server" {
 		runServer(*listenAddr, *forwardAddr)
 	} else {
-		runClient(*remoteAddr, *localProxy)
+		if *remoteAddr == "" {
+			log.Fatal("remote address required in client mode")
+		}
+		runClient(*localProxy, *remoteAddr)
 	}
 }
 
-// --- بخش سرور ---
 func runServer(listenAddr, forwardAddr string) {
 	tlsConf := generateTLSConfig()
 	listener, err := quic.ListenAddr(listenAddr, tlsConf, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("[SERVER] Bridge Active. Forwarding to %s\n", forwardAddr)
+	defer listener.Close()
+
+	log.Printf("Server listening on %s, forwarding to %s", listenAddr, forwardAddr)
 
 	for {
-		conn, err := listener.Accept(context.Background())
+		qConn, err := listener.Accept(context.Background())
 		if err != nil {
+			log.Println("Accept error:", err)
 			continue
 		}
-		go func(qConn quic.Connection) {
-			for {
-				stream, err := qConn.AcceptStream(context.Background())
-				if err != nil {
-					return
-				}
-				go handleStealthStream(stream, forwardAddr)
-			}
-		}(conn)
+		go handleConnection(qConn, forwardAddr)
 	}
 }
 
-func handleStealthStream(stream quic.Stream, forwardAddr string) {
+func handleConnection(qConn quic.Connection, forwardAddr string) {
+	defer qConn.CloseWithError(0, "done")
+
+	for {
+		stream, err := qConn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+		go handleStream(stream, forwardAddr)
+	}
+}
+
+func handleStream(stream quic.Stream, forwardAddr string) {
 	defer stream.Close()
 
-	// 1. چک کردن Token (احراز هویت)
 	authBuf := make([]byte, len(AuthToken))
-	if _, err := io.ReadFull(stream, authBuf); err != nil || string(authBuf) != AuthToken {
+	if _, err := io.ReadFull(stream, authBuf); err != nil {
+		return
+	}
+	if string(authBuf) != AuthToken {
 		return
 	}
 
-	target, err := net.DialTimeout("tcp", forwardAddr, 5*time.Second)
+	tcpConn, err := net.DialTimeout("tcp", forwardAddr, 5*time.Second)
 	if err != nil {
 		return
 	}
-	defer target.Close()
+	defer tcpConn.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		io.Copy(stream, target)
-		wg.Done()
-	}()
-
-	go func() {
+	go io.Copy(stream, tcpConn)
+	
+	for {
 		header := make([]byte, 3)
-		for {
-			if _, err := io.ReadFull(stream, header); err != nil {
-				break
-			}
-			chunkLen := binary.BigEndian.Uint16(header[:2])
-			junkLen := uint8(header[2])
-
-			fullBuf := make([]byte, int(chunkLen)+int(junkLen))
-			if _, err := io.ReadFull(stream, fullBuf); err != nil {
-				break
-			}
-			target.Write(fullBuf[:chunkLen])
+		if _, err := io.ReadFull(stream, header); err != nil {
+			return
 		}
-		wg.Done()
-	}()
-	wg.Wait()
-}
 
-// --- بخش کلاینت ---
-type Peer struct {
-	remoteAddr string
-	conn       quic.Connection
-	streams    chan quic.Stream
-	mu         sync.Mutex
-}
+		payloadLen := binary.BigEndian.Uint16(header[:2])
+		junkLen := header[2]
+		totalLen := int(payloadLen) + int(junkLen)
 
-func runClient(remoteAddr, localProxy string) {
-	p := &Peer{
-		remoteAddr: remoteAddr,
-		streams:    make(chan quic.Stream, StreamPoolSize),
+		buf := make([]byte, totalLen)
+		if _, err := io.ReadFull(stream, buf); err != nil {
+			return
+		}
+
+		if _, err := tcpConn.Write(buf[:payloadLen]); err != nil {
+			return
+		}
 	}
+}
 
-	go p.maintainConnection()
-
-	l, err := net.Listen("tcp", localProxy)
+func runClient(localProxy, remoteAddr string) {
+	listener, err := net.Listen("tcp", localProxy)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("[CLIENT] Tunnel Active on %s -> %s\n", localProxy, remoteAddr)
+	defer listener.Close()
+
+	log.Printf("SOCKS5 proxy listening on %s, tunneling to %s", localProxy, remoteAddr)
 
 	for {
-		c, err := l.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
+			log.Println("Accept error:", err)
 			continue
 		}
-		go p.shredderForward(c)
+		go handleSOCKS5(conn, remoteAddr)
 	}
 }
 
-// مدیریت اتصال و برقراری مجدد در صورت قطع شدن
-func (p *Peer) maintainConnection() {
-	for {
-		if p.conn == nil || p.conn.Context().Err() != nil {
-			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{ProtocolALPN}, ServerName: SNI}
-			conn, err := quic.DialAddr(context.Background(), p.remoteAddr, tlsConf, nil)
-			if err != nil {
-				time.Sleep(2 * time.Second)
-				continue
-			}
-			p.conn = conn
-			// پر کردن استخر استریم‌ها
-			for i := 0; i < StreamPoolSize; i++ {
-				s, _ := conn.OpenStream()
-				if s != nil {
-					s.Write([]byte(AuthToken)) // ارسال توکن بلافاصله بعد از باز شدن
-					p.streams <- s
-				}
-			}
-		}
-		time.Sleep(1 * time.Second)
+func handleSOCKS5(conn net.Conn, remoteAddr string) {
+	defer conn.Close()
+
+	// SOCKS5 handshake
+	buf := make([]byte, 256)
+	n, err := conn.Read(buf)
+	if err != nil || n < 2 || buf[0] != 0x05 {
+		return
 	}
-}
 
-func (p *Peer) shredderForward(localConn net.Conn) {
-	defer localConn.Close()
+	// No authentication
+	conn.Write([]byte{0x05, 0x00})
 
-	var stream quic.Stream
-	select {
-	case stream = <-p.streams:
-		// استریم را گرفتیم، یکی جدید جایگزین می‌کنیم
-		go func() {
-			if p.conn != nil {
-				s, err := p.conn.OpenStream()
-				if err == nil {
-					s.Write([]byte(AuthToken))
-					p.streams <- s
-				}
-			}
-		}()
-	case <-time.After(3 * time.Second):
+	// Read request
+	n, err = conn.Read(buf)
+	if err != nil || n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
+		return
+	}
+
+	// Parse target address
+	var targetAddr string
+	switch buf[3] {
+	case 0x01: // IPv4
+		targetAddr = fmt.Sprintf("%d.%d.%d.%d:%d",
+			buf[4], buf[5], buf[6], buf[7],
+			binary.BigEndian.Uint16(buf[8:10]))
+	case 0x03: // Domain
+		domainLen := int(buf[4])
+		targetAddr = fmt.Sprintf("%s:%d",
+			string(buf[5:5+domainLen]),
+			binary.BigEndian.Uint16(buf[5+domainLen:7+domainLen]))
+	case 0x04: // IPv6
+		return // Not implemented
+	default:
+		return
+	}
+
+	// Connect via QUIC tunnel
+	tlsConf := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{ProtocolALPN},
+		ServerName:         SNI,
+	}
+
+	qConn, err := quic.DialAddr(context.Background(), remoteAddr, tlsConf, nil)
+	if err != nil {
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer qConn.CloseWithError(0, "done")
+
+	stream, err := qConn.OpenStream()
+	if err != nil {
+		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer stream.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
+	// Send auth token
+	stream.Write([]byte(AuthToken))
 
-	// سرور به کلاینت (دریافت مستقیم)
-	go func() {
-		io.Copy(localConn, stream)
-		wg.Done()
-	}()
+	// Send target address to server (new feature)
+	targetBytes := []byte(targetAddr)
+	lenBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(lenBuf, uint16(len(targetBytes)))
+	stream.Write(lenBuf)
+	stream.Write(targetBytes)
 
-	// کلاینت به سرور (Shredding)
-	go func() {
-		buf := bufferPool.Get().([]byte)
-		defer bufferPool.Put(buf)
+	// SOCKS5 success response
+	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-		for {
-			n, err := localConn.Read(buf[:MaxChunkSize])
-			if err != nil {
-				break
-			}
+	// Relay data
+	go io.Copy(conn, stream)
+	relayToQUIC(conn, stream)
+}
 
-			junkLen := uint8(time.Now().UnixNano() % 64)
-			header := make([]byte, 3)
-			binary.BigEndian.PutUint16(header[:2], uint16(n))
-			header[2] = junkLen
-
-			junk := make([]byte, junkLen)
-			rand.Read(junk)
-
-			stream.Write(header)
-			stream.Write(buf[:n])
-			stream.Write(junk)
+func relayToQUIC(src net.Conn, dst quic.Stream) {
+	buf := make([]byte, MaxChunkSize)
+	for {
+		n, err := src.Read(buf)
+		if err != nil {
+			return
 		}
-		wg.Done()
-	}()
-	wg.Wait()
+
+		junkLen := byte(rand.Intn(64))
+		header := make([]byte, 3)
+		binary.BigEndian.PutUint16(header[:2], uint16(n))
+		header[2] = junkLen
+
+		junk := make([]byte, junkLen)
+		rand.Read(junk)
+
+		dst.Write(header)
+		dst.Write(buf[:n])
+		dst.Write(junk)
+	}
 }
 
 func generateTLSConfig() *tls.Config {
-	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	template := x509.Certificate{
 		SerialNumber: big.NewInt(1),
-		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
-		BasicConstraintsValid: true,
-		IsCA: true,
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
 	}
-	certDER, _ := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	tlsCert, _ := tls.X509KeyPair(certPEM, keyPEM)
-	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{ProtocolALPN}}
+
+	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		NextProtos:   []string{ProtocolALPN},
+	}
 }
