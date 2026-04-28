@@ -25,8 +25,21 @@ const (
 	MaxChunkSize   = 800
 	ProtocolALPN   = "h3"
 	SNI            = "www.google.com"
-	AuthToken      = "ef92b778ba715867219a6"
+	AuthToken      = "MySecretToken123"
 )
+
+// wrapper برای سازگاری با io.Reader/Writer
+type streamWrapper struct {
+	quic.Stream
+}
+
+func (s *streamWrapper) Read(p []byte) (int, error) {
+	return s.Stream.Read(p)
+}
+
+func (s *streamWrapper) Write(p []byte) (int, error) {
+	return s.Stream.Write(p)
+}
 
 type Peer struct {
 	remoteAddr string
@@ -89,19 +102,22 @@ func handleStealthStream(stream quic.Stream) {
 
 	// بررسی AuthToken
 	tokenBuf := make([]byte, len(AuthToken))
-	if _, err := io.ReadFull(stream, tokenBuf); err != nil || string(tokenBuf) != AuthToken {
+	n, err := stream.Read(tokenBuf)
+	if err != nil || n != len(AuthToken) || string(tokenBuf) != AuthToken {
 		return
 	}
 
 	// خواندن آدرس هدف
 	addrLenBuf := make([]byte, 2)
-	if _, err := io.ReadFull(stream, addrLenBuf); err != nil {
+	n, err = stream.Read(addrLenBuf)
+	if err != nil || n != 2 {
 		return
 	}
 	addrLen := binary.BigEndian.Uint16(addrLenBuf)
 
 	addrBuf := make([]byte, addrLen)
-	if _, err := io.ReadFull(stream, addrBuf); err != nil {
+	n, err = stream.Read(addrBuf)
+	if err != nil || n != int(addrLen) {
 		return
 	}
 	forwardAddr := string(addrBuf)
@@ -121,7 +137,8 @@ func handleStealthStream(stream quic.Stream) {
 		defer func() { done <- struct{}{} }()
 		for {
 			header := make([]byte, 3)
-			if _, err := io.ReadFull(stream, header); err != nil {
+			n, err := stream.Read(header)
+			if err != nil || n != 3 {
 				return
 			}
 
@@ -130,20 +147,20 @@ func handleStealthStream(stream quic.Stream) {
 
 			totalLen := int(payloadLen) + int(junkLen)
 			buf := make([]byte, totalLen)
-			if _, err := io.ReadFull(stream, buf); err != nil {
+			n, err = stream.Read(buf)
+			if err != nil || n != totalLen {
 				return
 			}
 
-			if _, err := target.Write(buf[:payloadLen]); err != nil {
-				return
-			}
+			target.Write(buf[:payloadLen])
 		}
 	}()
 
 	// TCP → QUIC
 	go func() {
 		defer func() { done <- struct{}{} }()
-		io.Copy(stream, target)
+		wrapped := &streamWrapper{stream}
+		io.Copy(wrapped, target)
 	}()
 
 	<-done
@@ -302,7 +319,8 @@ func (p *Peer) shredderForward(localConn net.Conn, targetAddr string) {
 	// QUIC → TCP
 	go func() {
 		defer func() { done <- struct{}{} }()
-		io.Copy(localConn, stream)
+		wrapped := &streamWrapper{stream}
+		io.Copy(localConn, wrapped)
 	}()
 
 	// TCP → QUIC
