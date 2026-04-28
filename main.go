@@ -23,15 +23,15 @@ import (
 
 // --- تنظیمات امنیتی ---
 const (
-	SharedSecret = "Ghost-Protocol-Key-2024" // کلید مشترک برای تولید توکن
-	ALPN         = "h3"                     // جعل ترافیک HTTP/3
-	MaxSkew      = 30                       // ۳۰ ثانیه اعتبار برای هر پکت (Anti-Replay)
+	SharedSecret = "Ghost-Protocol-Key-2024" // حتما این را عوض کنید
+	ALPN         = "h3"                     
+	MaxSkew      = 30                       
 )
 
 func main() {
 	mode := flag.String("mode", "server", "server or client")
-	addr := flag.String("addr", "0.0.0.0:443", "listen address (UDP for QUIC, TCP for SOCKS5)")
-	serverPtr := flag.String("server", "127.0.0.1:443", "remote server address (for client mode)")
+	addr := flag.String("addr", "0.0.0.0:443", "listen address")
+	serverPtr := flag.String("server", "127.0.0.1:443", "remote server address")
 	flag.Parse()
 
 	if *mode == "server" {
@@ -94,7 +94,8 @@ func runServer(listenAddr string) {
 	}
 }
 
-func handleConnection(conn quic.Connection) {
+// اصلاح شده: استفاده از *quic.Connection
+func handleConnection(conn *quic.Connection) {
 	for {
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
@@ -104,27 +105,25 @@ func handleConnection(conn quic.Connection) {
 	}
 }
 
-func handleStream(stream quic.Stream) {
+// اصلاح شده: استفاده از *quic.Stream
+func handleStream(stream *quic.Stream) {
 	defer stream.Close()
 
-	// ۱. تایید هویت ضد بازپخش
 	tokenBuf := make([]byte, 40)
 	stream.SetReadDeadline(time.Now().Add(3 * time.Second))
+	// حالا stream چون اشاره‌گر است، متد Read را پیاده‌سازی می‌کند
 	if _, err := io.ReadFull(stream, tokenBuf); err != nil || !verifyToken(tokenBuf) {
-		// فریب: ارسال دیتای رندوم برای گیج کردن اسکنر
 		stream.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
 		return
 	}
 	stream.SetReadDeadline(time.Time{})
 
-	// ۲. خواندن مقصد
 	lenBuf := make([]byte, 1)
 	io.ReadFull(stream, lenBuf)
 	addrBuf := make([]byte, int(lenBuf[0]))
 	io.ReadFull(stream, addrBuf)
 	targetAddr := string(addrBuf)
 
-	// ۳. اتصال به اینترنت آزاد
 	fmt.Printf("🚀 Tunneling to: %s\n", targetAddr)
 	target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
 	if err != nil {
@@ -146,7 +145,7 @@ func runClient(localAddr, serverAddr string) {
 	tlsConf := &tls.Config{
 		InsecureSkipVerify: true,
 		NextProtos:         []string{ALPN},
-		ServerName:         "www.google.com", // جعل SNI
+		ServerName:         "www.google.com",
 	}
 
 	qConn, err := quic.DialAddr(context.Background(), serverAddr, tlsConf, nil)
@@ -169,41 +168,39 @@ func runClient(localAddr, serverAddr string) {
 	}
 }
 
-func handleSocks(client net.Conn, qConn quic.Connection) {
+// اصلاح شده: استفاده از *quic.Connection
+func handleSocks(client net.Conn, qConn *quic.Connection) {
 	defer client.Close()
 
-	// هندشیک ساده SOCKS5
 	buf := make([]byte, 256)
-	io.ReadFull(client, buf[:2]) // روش‌های احراز هویت
+	client.Read(buf[:2]) 
 	client.Write([]byte{0x05, 0x00})
 
-	io.ReadFull(client, buf[:4]) // درخواست CMD
+	client.Read(buf[:4])
 	var target string
-	if buf[3] == 0x01 { // IPv4
+	if buf[3] == 0x01 {
 		io.ReadFull(client, buf[:4])
 		ip := net.IP(buf[:4])
 		io.ReadFull(client, buf[:2])
 		port := binary.BigEndian.Uint16(buf[:2])
 		target = fmt.Sprintf("%s:%d", ip, port)
-	} else if buf[3] == 0x03 { // Domain name
+	} else if buf[3] == 0x03 {
 		io.ReadFull(client, buf[:1])
-		len := int(buf[0])
-		io.ReadFull(client, buf[:len])
-		domain := string(buf[:len])
+		length := int(buf[0])
+		io.ReadFull(client, buf[:length])
+		domain := string(buf[:length])
 		io.ReadFull(client, buf[:2])
 		port := binary.BigEndian.Uint16(buf[:2])
 		target = fmt.Sprintf("%s:%d", domain, port)
 	}
 	client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 
-	// ایجاد استریم در تونل QUIC
 	stream, err := qConn.OpenStreamSync(context.Background())
 	if err != nil {
 		return
 	}
 	defer stream.Close()
 
-	// ارسال توکن امنیتی و آدرس مقصد
 	stream.Write(generateToken())
 	stream.Write([]byte{byte(len(target))})
 	stream.Write([]byte(target))
