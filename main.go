@@ -27,6 +27,18 @@ const (
 	AuthToken      = "ef92b778ba715867219a6"
 )
 
+type streamWrapper struct {
+	quic.Stream
+}
+
+func (s *streamWrapper) Read(p []byte) (n int, err error) {
+	return s.Stream.Read(p)
+}
+
+func (s *streamWrapper) Write(p []byte) (n int, err error) {
+	return s.Stream.Write(p)
+}
+
 type Peer struct {
 	remoteAddr string
 	conn       quic.Connection
@@ -76,13 +88,13 @@ func runServer(listenAddr string) {
 				if err != nil {
 					return
 				}
-				go handleStealthStream(stream)
+				go handleStealthStream(&streamWrapper{stream})
 			}
 		}(qConn)
 	}
 }
 
-func handleStealthStream(stream quic.Stream) {
+func handleStealthStream(stream io.ReadWriteCloser) {
 	defer stream.Close()
 
 	// بررسی AuthToken
@@ -287,13 +299,14 @@ func (p *Peer) shredderForward(localConn net.Conn, targetAddr string) {
 	// QUIC → TCP
 	go func() {
 		defer func() { done <- struct{}{} }()
-		io.Copy(localConn, stream)
+		io.Copy(localConn, &streamWrapper{stream})
 	}()
 
 	// TCP → QUIC
 	go func() {
 		defer func() { done <- struct{}{} }()
 		buf := make([]byte, MaxChunkSize)
+		sw := &streamWrapper{stream}
 		for {
 			n, err := localConn.Read(buf)
 			if err != nil {
@@ -308,9 +321,9 @@ func (p *Peer) shredderForward(localConn net.Conn, targetAddr string) {
 			binary.BigEndian.PutUint16(header[:2], uint16(n))
 			header[2] = junkLen
 
-			stream.Write(header)
-			stream.Write(buf[:n])
-			stream.Write(junk)
+			sw.Write(header)
+			sw.Write(buf[:n])
+			sw.Write(junk)
 		}
 	}()
 
