@@ -21,18 +21,25 @@ import (
 )
 
 const (
-	StreamPoolSize = 50
-	MaxChunkSize   = 800 // سایز هر تکه برای مقابله با DPI
+	StreamPoolSize = 20
+	MaxChunkSize   = 800
 	ProtocolALPN   = "h3"
 	SNI            = "www.google.com"
+	AuthToken      = "MySecretToken123" // حتما این را تغییر دهید
 )
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, MaxChunkSize+100)
+	},
+}
 
 func main() {
 	mode := flag.String("mode", "server", "server or client")
 	remoteAddr := flag.String("remote", "127.0.0.1:443", "Server address")
 	listenAddr := flag.String("listen", "0.0.0.0:443", "Listen address")
-	forwardAddr := flag.String("forward", "127.0.0.1:8080", "X-UI port")
-	localProxy := flag.String("proxy", "127.0.0.1:10808", "Local SOCKS/Tunnel port")
+	forwardAddr := flag.String("forward", "127.0.0.1:8080", "X-UI/Upstream port")
+	localProxy := flag.String("proxy", "127.0.0.1:10808", "Local port")
 	flag.Parse()
 
 	if *mode == "server" {
@@ -44,11 +51,12 @@ func main() {
 
 // --- بخش سرور ---
 func runServer(listenAddr, forwardAddr string) {
-	listener, err := quic.ListenAddr(listenAddr, generateTLSConfig(), nil)
+	tlsConf := generateTLSConfig()
+	listener, err := quic.ListenAddr(listenAddr, tlsConf, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Printf("[SERVER] G-Stealth Running... Forwarding to %s\n", forwardAddr)
+	fmt.Printf("[SERVER] Bridge Active. Forwarding to %s\n", forwardAddr)
 
 	for {
 		conn, err := listener.Accept(context.Background())
@@ -69,7 +77,14 @@ func runServer(listenAddr, forwardAddr string) {
 
 func handleStealthStream(stream quic.Stream, forwardAddr string) {
 	defer stream.Close()
-	target, err := net.Dial("tcp", forwardAddr)
+
+	// 1. چک کردن Token (احراز هویت)
+	authBuf := make([]byte, len(AuthToken))
+	if _, err := io.ReadFull(stream, authBuf); err != nil || string(authBuf) != AuthToken {
+		return
+	}
+
+	target, err := net.DialTimeout("tcp", forwardAddr, 5*time.Second)
 	if err != nil {
 		return
 	}
@@ -78,16 +93,14 @@ func handleStealthStream(stream quic.Stream, forwardAddr string) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// از سرور به کلاینت
 	go func() {
 		io.Copy(stream, target)
 		wg.Done()
 	}()
 
-	// از کلاینت به سرور (بازسازی دیتای خرد شده)
 	go func() {
+		header := make([]byte, 3)
 		for {
-			header := make([]byte, 3) // [ChunkLen (2)] [JunkLen (1)]
 			if _, err := io.ReadFull(stream, header); err != nil {
 				break
 			}
@@ -98,7 +111,7 @@ func handleStealthStream(stream quic.Stream, forwardAddr string) {
 			if _, err := io.ReadFull(stream, fullBuf); err != nil {
 				break
 			}
-			target.Write(fullBuf[:chunkLen]) // فقط دیتای اصلی را به X-UI می‌فرستیم
+			target.Write(fullBuf[:chunkLen])
 		}
 		wg.Done()
 	}()
@@ -107,71 +120,111 @@ func handleStealthStream(stream quic.Stream, forwardAddr string) {
 
 // --- بخش کلاینت ---
 type Peer struct {
-	conn    quic.Connection
-	streams chan quic.Stream
+	remoteAddr string
+	conn       quic.Connection
+	streams    chan quic.Stream
+	mu         sync.Mutex
 }
 
 func runClient(remoteAddr, localProxy string) {
-	tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{ProtocolALPN}, ServerName: SNI}
-	conn, err := quic.DialAddr(context.Background(), remoteAddr, tlsConf, nil)
+	p := &Peer{
+		remoteAddr: remoteAddr,
+		streams:    make(chan quic.Stream, StreamPoolSize),
+	}
+
+	go p.maintainConnection()
+
+	l, err := net.Listen("tcp", localProxy)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	p := &Peer{
-		conn:    conn,
-		streams: make(chan quic.Stream, StreamPoolSize),
-	}
-
-	for i := 0; i < StreamPoolSize; i++ {
-		s, _ := conn.OpenStreamSync(context.Background())
-		p.streams <- s
-	}
-
-	l, _ := net.Listen("tcp", localProxy)
-	fmt.Printf("[CLIENT] G-Stealth Tunnel Active on %s\n", localProxy)
+	fmt.Printf("[CLIENT] Tunnel Active on %s -> %s\n", localProxy, remoteAddr)
 
 	for {
-		c, _ := l.Accept()
+		c, err := l.Accept()
+		if err != nil {
+			continue
+		}
 		go p.shredderForward(c)
+	}
+}
+
+// مدیریت اتصال و برقراری مجدد در صورت قطع شدن
+func (p *Peer) maintainConnection() {
+	for {
+		if p.conn == nil || p.conn.Context().Err() != nil {
+			tlsConf := &tls.Config{InsecureSkipVerify: true, NextProtos: []string{ProtocolALPN}, ServerName: SNI}
+			conn, err := quic.DialAddr(context.Background(), p.remoteAddr, tlsConf, nil)
+			if err != nil {
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			p.conn = conn
+			// پر کردن استخر استریم‌ها
+			for i := 0; i < StreamPoolSize; i++ {
+				s, _ := conn.OpenStream()
+				if s != nil {
+					s.Write([]byte(AuthToken)) // ارسال توکن بلافاصله بعد از باز شدن
+					p.streams <- s
+				}
+			}
+		}
+		time.Sleep(1 * time.Second)
 	}
 }
 
 func (p *Peer) shredderForward(localConn net.Conn) {
 	defer localConn.Close()
-	stream := <-p.streams
-	// شارژ مجدد استخر
-	go func() { s, _ := p.conn.OpenStreamSync(context.Background()); p.streams <- s }()
+
+	var stream quic.Stream
+	select {
+	case stream = <-p.streams:
+		// استریم را گرفتیم، یکی جدید جایگزین می‌کنیم
+		go func() {
+			if p.conn != nil {
+				s, err := p.conn.OpenStream()
+				if err == nil {
+					s.Write([]byte(AuthToken))
+					p.streams <- s
+				}
+			}
+		}()
+	case <-time.After(3 * time.Second):
+		return
+	}
+	defer stream.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// دریافت مستقیم از سرور
-	go func() { io.Copy(localConn, stream); wg.Done() }()
-
-	// ارسال به سرور با مکانیزم Shredding
+	// سرور به کلاینت (دریافت مستقیم)
 	go func() {
-		buf := make([]byte, MaxChunkSize)
+		io.Copy(localConn, stream)
+		wg.Done()
+	}()
+
+	// کلاینت به سرور (Shredding)
+	go func() {
+		buf := bufferPool.Get().([]byte)
+		defer bufferPool.Put(buf)
+
 		for {
-			n, err := localConn.Read(buf)
+			n, err := localConn.Read(buf[:MaxChunkSize])
 			if err != nil {
 				break
 			}
 
-			// هدر: طول دیتا و طول Junk
-			junkLen := uint8(time.Now().UnixNano() % 50) // مقدار تصادفی Junk
+			junkLen := uint8(time.Now().UnixNano() % 64)
 			header := make([]byte, 3)
 			binary.BigEndian.PutUint16(header[:2], uint16(n))
 			header[2] = junkLen
 
-			// دیتای تصادفی
 			junk := make([]byte, junkLen)
 			rand.Read(junk)
 
-			// ارسال پکت نهایی: [Header][Data][Junk]
-			packet := append(header, buf[:n]...)
-			packet = append(packet, junk...)
-			stream.Write(packet)
+			stream.Write(header)
+			stream.Write(buf[:n])
+			stream.Write(junk)
 		}
 		wg.Done()
 	}()
@@ -180,10 +233,15 @@ func (p *Peer) shredderForward(localConn net.Conn) {
 
 func generateTLSConfig() *tls.Config {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
-	template := x509.Certificate{SerialNumber: big.NewInt(1), NotAfter: time.Now().Add(time.Hour * 24 * 365)}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotAfter:     time.Now().Add(time.Hour * 24 * 365),
+		BasicConstraintsValid: true,
+		IsCA: true,
+	}
 	certDER, _ := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	tlsCert, _ := tls.X509KeyPair(certPEM, keyPEM)
-	return &tls.Config{Certificates: []tls.Config{tlsCert}, NextProtos: []string{ProtocolALPN}}
+	return &tls.Config{Certificates: []tls.Certificate{tlsCert}, NextProtos: []string{ProtocolALPN}}
 }
