@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -13,34 +14,33 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
+// Protocol constants
 const (
-	ProtocolVersion = 1
-	MaxPacketSize   = 1350
-	MaxPayloadSize  = 1200
-	MinPaddingSize  = 16
-	MaxPaddingSize  = 128
-	NonceSize       = 24 // XChaCha20 uses 24-byte nonce
-	TagSize         = 16
-	HeaderSize      = 22
-
-	SendBufferSize   = 4 * 1024 * 1024
-	RecvBufferSize   = 4 * 1024 * 1024
+	ProtocolVersion   = 1
+	MaxPacketSize     = 1350
+	MaxPayloadSize    = 1200
+	MinPaddingSize    = 16
+	MaxPaddingSize    = 128
+	NonceSize         = 24 // XChaCha20-Poly1305 uses 24-byte nonces
+	TagSize           = 16
+	HeaderSize        = 22 // Version(1) + Type(1) + StreamID(4) + Sequence(4) + Timestamp(8) + WindowSize(2) + Flags(2)
+	SendBufferSize    = 4 * 1024 * 1024
+	RecvBufferSize    = 4 * 1024 * 1024
 	MaxStreamsPerConn = 256
 	StreamBufferSize  = 64 * 1024
-
-	MaxPacketAge       = 5 * time.Second
-	KeepAliveInterval  = 10 * time.Second
-	ConnectionTimeout  = 30 * time.Second
-	RetransmitTimeout  = 200 * time.Millisecond
-	MaxRetransmits     = 5
-
-	InitialWindow = 10
-	MaxWindow     = 1000
-	MinWindow     = 2
+	MaxPacketAge      = 5 * time.Second
+	KeepAliveInterval = 10 * time.Second
+	ConnectionTimeout = 30 * time.Second
+	RetransmitTimeout = 200 * time.Millisecond
+	MaxRetransmits    = 5
+	InitialWindow     = 10
+	MaxWindow         = 1000
+	MinWindow         = 2
 )
 
+// Packet types
 const (
-	PacketTypeData uint8 = iota
+	PacketTypeData byte = iota
 	PacketTypeAck
 	PacketTypePing
 	PacketTypePong
@@ -68,31 +68,6 @@ type PacketHeader struct {
 	Flags      uint16
 }
 
-type SpaceShuttleConn struct {
-	conn       *net.UDPConn
-	cipher     chacha20poly1305.AEAD
-	remoteAddr *net.UDPAddr
-
-	bytesSent   atomic.Uint64
-	bytesRecv   atomic.Uint64
-	packetsSent atomic.Uint64
-	packetsRecv atomic.Uint64
-
-	lastSendTime  atomic.Int64
-	adaptiveDelay atomic.Int64
-	closed        atomic.Bool
-
-	mu sync.RWMutex
-}
-
-func getBuffer() *[]byte {
-	return bufferPool.Get().(*[]byte)
-}
-
-func putBuffer(buf *[]byte) {
-	bufferPool.Put(buf)
-}
-
 func (h *PacketHeader) Encode(buf []byte) {
 	buf[0] = h.Version
 	buf[1] = h.Type
@@ -117,29 +92,44 @@ func (h *PacketHeader) Decode(buf []byte) error {
 	return nil
 }
 
-func NewSpaceShuttleConn(localAddr string, remoteAddr string, key []byte) (*SpaceShuttleConn, error) {
-	if len(key) != 32 {
-		return nil, errors.New("key must be 32 bytes")
-	}
+type SpaceShuttleConn struct {
+	conn       *net.UDPConn
+	cipher     cipher.AEAD // ✅ تغییر از *chacha20poly1305.XChaCha20Poly1305 به cipher.AEAD
+	remoteAddr *net.UDPAddr
 
-	cipher, err := chacha20poly1305.NewX(key)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	// Statistics
+	bytesSent     uint64
+	bytesReceived uint64
+	packetsSent   uint64
+	packetsRecv   uint64
+	packetsLost   uint64
+
+	// Adaptive delay
+	adaptiveDelay time.Duration
+	delayMu       sync.RWMutex
+
+	closed uint32
+	mu     sync.RWMutex
+}
+
+func NewSpaceShuttleConn(localAddr string, remoteAddr string, key []byte) (*SpaceShuttleConn, error) {
+	if len(key) != chacha20poly1305.KeySize {
+		return nil, fmt.Errorf("invalid key size: expected %d, got %d", chacha20poly1305.KeySize, len(key))
 	}
 
 	laddr, err := net.ResolveUDPAddr("udp", localAddr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid local address: %w", err)
+		return nil, fmt.Errorf("failed to resolve local address: %w", err)
 	}
 
 	raddr, err := net.ResolveUDPAddr("udp", remoteAddr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid remote address: %w", err)
+		return nil, fmt.Errorf("failed to resolve remote address: %w", err)
 	}
 
 	conn, err := net.ListenUDP("udp", laddr)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create UDP socket: %w", err)
+		return nil, fmt.Errorf("failed to create UDP connection: %w", err)
 	}
 
 	if err := conn.SetReadBuffer(RecvBufferSize); err != nil {
@@ -152,86 +142,90 @@ func NewSpaceShuttleConn(localAddr string, remoteAddr string, key []byte) (*Spac
 		return nil, fmt.Errorf("failed to set write buffer: %w", err)
 	}
 
+	aead, err := chacha20poly1305.NewX(key)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("failed to create cipher: %w", err)
+	}
+
 	sc := &SpaceShuttleConn{
-		conn:       conn,
-		cipher:     cipher,
-		remoteAddr: raddr,
+		conn:          conn,
+		cipher:        aead,
+		remoteAddr:    raddr,
+		adaptiveDelay: 0,
 	}
 
 	return sc, nil
 }
 
-func (sc *SpaceShuttleConn) SendPacket(header *PacketHeader, payload []byte, addr *net.UDPAddr) error {
-	if sc.closed.Load() {
+func (sc *SpaceShuttleConn) SendPacket(header *PacketHeader, payload []byte) error {
+	if atomic.LoadUint32(&sc.closed) == 1 {
 		return errors.New("connection closed")
 	}
 
-	if len(payload) > MaxPayloadSize {
-		return errors.New("payload too large")
-	}
-
-	buf := getBuffer()
-	defer putBuffer(buf)
-
-	plaintext := (*buf)[:0]
-	plaintext = append(plaintext, make([]byte, HeaderSize)...)
-	header.Encode(plaintext[:HeaderSize])
-	plaintext = append(plaintext, payload...)
+	headerBuf := make([]byte, HeaderSize)
+	header.Encode(headerBuf)
 
 	padding := sc.calculatePadding(len(payload))
+	plaintext := make([]byte, HeaderSize+len(payload)+padding+1)
+	copy(plaintext[0:HeaderSize], headerBuf)
+	copy(plaintext[HeaderSize:], payload)
 	if padding > 0 {
-		paddingBytes := make([]byte, padding)
-		rand.Read(paddingBytes)
-		plaintext = append(plaintext, paddingBytes...)
+		if _, err := rand.Read(plaintext[HeaderSize+len(payload) : HeaderSize+len(payload)+padding]); err != nil {
+			return fmt.Errorf("failed to generate padding: %w", err)
+		}
 	}
-	plaintext = append(plaintext, byte(padding))
+	plaintext[len(plaintext)-1] = byte(padding)
 
-	nonce := make([]byte, NonceSize)
+	nonce := make([]byte, sc.cipher.NonceSize())
 	if _, err := rand.Read(nonce); err != nil {
 		return fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
-	ciphertext := sc.cipher.Seal(nil, nonce, plaintext, nil)
+	ciphertext := sc.cipher.Seal(nonce, nonce, plaintext, nil)
 
-	packet := make([]byte, 0, NonceSize+len(ciphertext))
-	packet = append(packet, nonce...)
-	packet = append(packet, ciphertext...)
+	sc.delayMu.RLock()
+	delay := sc.adaptiveDelay
+	sc.delayMu.RUnlock()
 
-	if addr == nil {
-		addr = sc.remoteAddr
+	if delay > 0 {
+		time.Sleep(delay)
 	}
 
-	n, err := sc.conn.WriteToUDP(packet, addr)
+	_, err := sc.conn.WriteToUDP(ciphertext, sc.remoteAddr)
 	if err != nil {
 		return fmt.Errorf("failed to send packet: %w", err)
 	}
 
-	sc.packetsSent.Add(1)
-	sc.bytesSent.Add(uint64(n))
-	sc.lastSendTime.Store(time.Now().UnixNano())
+	atomic.AddUint64(&sc.bytesSent, uint64(len(ciphertext)))
+	atomic.AddUint64(&sc.packetsSent, 1)
 
 	return nil
 }
 
 func (sc *SpaceShuttleConn) RecvPacket() (*PacketHeader, []byte, *net.UDPAddr, error) {
-	if sc.closed.Load() {
+	if atomic.LoadUint32(&sc.closed) == 1 {
 		return nil, nil, nil, errors.New("connection closed")
 	}
 
-	buf := getBuffer()
-	defer putBuffer(buf)
+	bufPtr := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufPtr)
+	buf := *bufPtr
 
-	n, addr, err := sc.conn.ReadFromUDP(*buf)
+	n, addr, err := sc.conn.ReadFromUDP(buf)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to receive packet: %w", err)
 	}
 
-	if n < NonceSize+TagSize {
+	atomic.AddUint64(&sc.bytesReceived, uint64(n))
+	atomic.AddUint64(&sc.packetsRecv, 1)
+
+	if n < sc.cipher.NonceSize()+sc.cipher.Overhead() {
 		return nil, nil, nil, errors.New("packet too small")
 	}
 
-	nonce := (*buf)[:NonceSize]
-	ciphertext := (*buf)[NonceSize:n]
+	nonce := buf[:sc.cipher.NonceSize()]
+	ciphertext := buf[sc.cipher.NonceSize():n]
 
 	plaintext, err := sc.cipher.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
@@ -254,52 +248,42 @@ func (sc *SpaceShuttleConn) RecvPacket() (*PacketHeader, []byte, *net.UDPAddr, e
 		return nil, nil, nil, fmt.Errorf("failed to decode header: %w", err)
 	}
 
-	now := time.Now().UnixNano()
-	age := time.Duration(now - header.Timestamp)
-	if age > MaxPacketAge || age < -MaxPacketAge {
-		return nil, nil, nil, errors.New("packet timestamp out of range")
-	}
-
 	payload := make([]byte, payloadEnd-HeaderSize)
 	copy(payload, plaintext[HeaderSize:payloadEnd])
-
-	sc.packetsRecv.Add(1)
-	sc.bytesRecv.Add(uint64(n))
 
 	return header, payload, addr, nil
 }
 
 func (sc *SpaceShuttleConn) calculatePadding(payloadSize int) int {
 	totalSize := HeaderSize + payloadSize
-	if totalSize >= MaxPacketSize-MaxPaddingSize {
+	if totalSize >= MaxPayloadSize {
 		return 0
 	}
-
-	maxPad := MaxPacketSize - totalSize - 1
-	if maxPad > MaxPaddingSize {
-		maxPad = MaxPaddingSize
-	}
+	maxPad := min(MaxPaddingSize, MaxPayloadSize-totalSize)
 	if maxPad < MinPaddingSize {
 		return 0
 	}
-
-	var randByte [1]byte
-	rand.Read(randByte[:])
-	padding := MinPaddingSize + int(randByte[0])%(maxPad-MinPaddingSize+1)
-
-	return padding
+	padBuf := make([]byte, 1)
+	rand.Read(padBuf)
+	return MinPaddingSize + int(padBuf[0])%(maxPad-MinPaddingSize+1)
 }
 
 func (sc *SpaceShuttleConn) SetAdaptiveDelay(delay time.Duration) {
-	sc.adaptiveDelay.Store(int64(delay))
+	sc.delayMu.Lock()
+	sc.adaptiveDelay = delay
+	sc.delayMu.Unlock()
 }
 
-func (sc *SpaceShuttleConn) GetStats() (sent, recv uint64) {
-	return sc.bytesSent.Load(), sc.bytesRecv.Load()
+func (sc *SpaceShuttleConn) GetStats() (sent, recv, pktSent, pktRecv, pktLost uint64) {
+	return atomic.LoadUint64(&sc.bytesSent),
+		atomic.LoadUint64(&sc.bytesReceived),
+		atomic.LoadUint64(&sc.packetsSent),
+		atomic.LoadUint64(&sc.packetsRecv),
+		atomic.LoadUint64(&sc.packetsLost)
 }
 
 func (sc *SpaceShuttleConn) Close() error {
-	if sc.closed.Swap(true) {
+	if !atomic.CompareAndSwapUint32(&sc.closed, 0, 1) {
 		return nil
 	}
 	return sc.conn.Close()
@@ -311,4 +295,11 @@ func (sc *SpaceShuttleConn) LocalAddr() net.Addr {
 
 func (sc *SpaceShuttleConn) RemoteAddr() net.Addr {
 	return sc.remoteAddr
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
