@@ -25,7 +25,7 @@ import (
 )
 
 const (
-	SecretKey     = "MySecretKey32BytesForAES256!!!!!" // 32 bytes for AES-256
+	SecretKey     = "kE?G-p_S9t!vA*z2B[vR4x7Z9m#qN@5u"
 	SpaceMaxAge   = 5 * time.Minute
 	SpaceMinPad   = 64
 	SpaceMaxPad   = 256
