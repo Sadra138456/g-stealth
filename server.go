@@ -1,11 +1,9 @@
-// server.go - SpaceShuttle server (no QUIC)
 package main
 
 import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"sync"
@@ -13,131 +11,126 @@ import (
 
 const (
 	ServerPort = ":8443"
+	SecretKey  = "CHANGE_THIS_TO_A_RANDOM_32_BYTE_KEY!"
 )
 
-var SecretKey = []byte("your-32-byte-secret-key-here!!!!") // 32 bytes
-
 type Server struct {
-	transport *SpaceShuttleConn
-	conns     map[string]*Connection
-	connsMu   sync.RWMutex
+	conn    *SpaceShuttleConn
+	clients map[string]*Connection
+	mu      sync.RWMutex
 }
 
-func NewServer(port string, key []byte) (*Server, error) {
-	transport, err := NewSpaceShuttleConn(port, "", key)
-	if err != nil {
-		return nil, fmt.Errorf("create transport: %w", err)
+func main() {
+	key := []byte(SecretKey)
+
+	if SecretKey == "CHANGE_THIS_TO_A_RANDOM_32_BYTE_KEY!" {
+		log.Println("⚠️  WARNING: Using default secret key!")
+		log.Println("Generating a random key for this session...")
+
+		newKey := make([]byte, 32)
+		if _, err := rand.Read(newKey); err != nil {
+			log.Fatal("Failed to generate random key:", err)
+		}
+		key = newKey
+		log.Printf("Generated key (save this): %s\n", hex.EncodeToString(key))
 	}
-	
+
+	log.Fatal(RunServer(ServerPort, key))
+}
+
+func NewServer(conn *SpaceShuttleConn) *Server {
 	return &Server{
-		transport: transport,
-		conns:     make(map[string]*Connection),
-	}, nil
+		conn:    conn,
+		clients: make(map[string]*Connection),
+	}
 }
 
 func (s *Server) Run() error {
-	log.Printf("SpaceShuttle server listening on %s", s.transport.LocalAddr())
-	
+	log.Printf("Server listening on %s\n", s.conn.LocalAddr())
+
 	for {
-		header, payload, addr, err := s.transport.RecvPacket()
+		header, payload, addr, err := s.conn.RecvPacket()
 		if err != nil {
-			log.Printf("recv error: %v", err)
+			log.Printf("Error receiving packet: %v\n", err)
 			continue
 		}
-		
-		// Get or create connection for this client
-		addrKey := addr.String()
-		s.connsMu.RLock()
-		conn, ok := s.conns[addrKey]
-		s.connsMu.RUnlock()
-		
-		if !ok {
-			// New client connection
-			clientTransport, err := NewSpaceShuttleConn("", addr.String(), SecretKey)
-			if err != nil {
-				log.Printf("create client transport: %v", err)
-				continue
+
+		clientKey := addr.String()
+
+		s.mu.RLock()
+		client, exists := s.clients[clientKey]
+		s.mu.RUnlock()
+
+		if !exists {
+			log.Printf("New client connection from %s\n", addr)
+
+			clientConn := &SpaceShuttleConn{
+				conn:       s.conn.conn,
+				cipher:     s.conn.cipher,
+				remoteAddr: addr,
 			}
-			
-			conn = NewConnection(clientTransport)
-			s.connsMu.Lock()
-			s.conns[addrKey] = conn
-			s.connsMu.Unlock()
-			
-			log.Printf("New client: %s", addr)
+
+			client = NewConnection(clientConn)
+
+			s.mu.Lock()
+			s.clients[clientKey] = client
+			s.mu.Unlock()
+
+			go s.handleClient(client)
 		}
-		
-		// Handle packet based on type
-		switch header.Type {
-		case PacketTypeStreamOpen:
-			go s.handleNewStream(conn, header.StreamID)
-		case PacketTypeStreamData:
-			// Routed by connection's receiveLoop
-		case PacketTypePing:
-			s.handlePing(addr)
+
+		if header.Type == PacketTypePing {
+			s.handlePing(header, addr)
 		}
 	}
 }
 
-func (s *Server) handleNewStream(conn *Connection, streamID uint32) {
-	// Create stream on server side
-	stream := newStream(streamID, conn)
-	
-	conn.streamsMu.Lock()
-	conn.streams[streamID] = stream
-	conn.streamsMu.Unlock()
-	
-	// Handle stream (proxy to destination)
-	go s.proxyStream(stream)
+func (s *Server) handleClient(client *Connection) {
+	for {
+		stream, err := client.AcceptStream()
+		if err != nil {
+			log.Printf("Error accepting stream: %v\n", err)
+			return
+		}
+
+		go s.handleNewStream(stream)
+	}
 }
 
-func (s *Server) proxyStream(stream *Stream) {
+func (s *Server) handleNewStream(stream *Stream) {
 	defer stream.Close()
-	
-	// Read destination address from first packet
-	buf := make([]byte, 1024)
+
+	buf := make([]byte, 4096)
 	n, err := stream.Read(buf)
 	if err != nil {
-		log.Printf("read dest addr: %v", err)
+		log.Printf("Error reading from stream: %v\n", err)
 		return
 	}
-	
-	destAddr := string(buf[:n])
-	log.Printf("Stream %d -> %s", stream.id, destAddr)
-	
-	// Connect to destination
-	dest, err := net.Dial("tcp", destAddr)
+
+	log.Printf("Received %d bytes on stream %d\n", n, stream.id)
+
+	targetAddr := string(buf[:n])
+	log.Printf("Proxying to %s\n", targetAddr)
+
+	s.proxyStream(stream, targetAddr)
+}
+
+func (s *Server) proxyStream(stream *Stream, targetAddr string) {
+	target, err := net.Dial("tcp", targetAddr)
 	if err != nil {
-		log.Printf("dial %s: %v", destAddr, err)
+		log.Printf("Failed to connect to target %s: %v\n", targetAddr, err)
 		return
 	}
-	defer dest.Close()
-	
-	// Bidirectional copy
+	defer target.Close()
+
 	var wg sync.WaitGroup
 	wg.Add(2)
-	
-	// Client -> Destination
+
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		for {
-			n, err := stream.Read(buf)
-			if err != nil {
-				return
-			}
-			if _, err := dest.Write(buf[:n]); err != nil {
-				return
-			}
-		}
-	}()
-	
-	// Destination -> Client
-	go func() {
-		defer wg.Done()
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := dest.Read(buf)
+			n, err := target.Read(buf)
 			if err != nil {
 				return
 			}
@@ -146,34 +139,42 @@ func (s *Server) proxyStream(stream *Stream) {
 			}
 		}
 	}()
-	
+
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := stream.Read(buf)
+			if err != nil {
+				return
+			}
+			if _, err := target.Write(buf[:n]); err != nil {
+				return
+			}
+		}
+	}()
+
 	wg.Wait()
 }
 
-func (s *Server) handlePing(addr *net.UDPAddr) {
-	header := &PacketHeader{
-		Version: ProtocolVersion,
-		Type:    PacketTypePong,
+func (s *Server) handlePing(header *PacketHeader, addr *net.UDPAddr) {
+	pong := &PacketHeader{
+		Version:   ProtocolVersion,
+		Type:      PacketTypePong,
+		Timestamp: header.Timestamp,
 	}
-	s.transport.SendPacket(header, nil, addr)
+
+	if err := s.conn.SendPacket(pong, nil, addr); err != nil {
+		log.Printf("Failed to send pong: %v\n", err)
+	}
 }
 
-func RunServer(port string) error {
-	server, err := NewServer(port, SecretKey)
+func RunServer(port string, key []byte) error {
+	conn, err := NewSpaceShuttleConn(port, "", key)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create server connection: %w", err)
 	}
-	return server.Run()
-}
 
-func main() {
-	// Generate random key if needed
-	if hex.EncodeToString(SecretKey) == hex.EncodeToString([]byte("your-32-byte-secret-key-here!!!!")) {
-		log.Println("WARNING: Using default key. Generate a secure key:")
-		key := make([]byte, 32)
-		rand.Read(key)
-		log.Printf("  SecretKey = []byte(\"%s\")", hex.EncodeToString(key))
-	}
-	
-	log.Fatal(RunServer(ServerPort))
+	server := NewServer(conn)
+	return server.Run()
 }
