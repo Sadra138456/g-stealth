@@ -1,466 +1,254 @@
-// stream.go - بخش‌های اصلاح شده
-
-package main
+package main // در صورتی که پکیج شما نام دیگری دارد، آن را تغییر دهید
 
 import (
 	"errors"
-	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var (
-	ErrStreamClosed      = errors.New("stream closed")
-	ErrConnectionClosed  = errors.New("connection closed")
-	ErrWindowExceeded    = errors.New("send window exceeded")
-	ErrInvalidSequence   = errors.New("invalid sequence number")
-	ErrBufferFull        = errors.New("receive buffer full")
+	ErrStreamClosed   = errors.New("stream closed")
+	ErrWindowFull     = errors.New("send window is full")
+	ConnectionTimeout = 30 * time.Second
 )
 
-// Stream با قابلیت segmentation و reassembly
-type Stream struct {
-	id          uint32
-	conn        *Connection
-	sendSeq     uint32
-	recvSeq     uint32
-	sendWindow  uint32
-	recvWindow  uint32
-	recvBuf     chan []byte
-	closed      atomic.Bool
-	closeMu     sync.Mutex
-	
-	// برای reassembly
-	pendingData map[uint32][]byte
-	pendingMu   sync.Mutex
-	
-	// برای retransmission
-	unackedPackets map[uint32]*unackedPacket
-	unackedMu      sync.RWMutex
-	
-	congestion *CongestionControl
+// ساختار برای نگهداری بسته‌هایی که هنوز ACK آن‌ها دریافت نشده است
+type unackedPacket struct {
+	header []byte
+	data   []byte
+	sentAt time.Time
+	seq    uint32
+	retries int
 }
 
-type unackedPacket struct {
-	header      *PacketHeader
-	payload     []byte
-	sentTime    time.Time
-	retries     int
+// -----------------------------------------------------------------
+// ساختار استریم (Stream)
+// -----------------------------------------------------------------
+type Stream struct {
+	id         uint32
+	conn       *Connection
+	sendSeq    atomic.Uint32
+	recvSeq    atomic.Uint32
+	sendWindow atomic.Uint32
+	recvWindow atomic.Uint32
+	closed     atomic.Bool
+
+	sendBuf chan []byte
+	recvBuf chan []byte
+	mu      sync.Mutex
+
+	// فیلدهای کنترل ارسال مجدد
+	unacked   map[uint32]*unackedPacket
+	unackedMu sync.Mutex
 }
 
 func newStream(id uint32, conn *Connection) *Stream {
 	s := &Stream{
-		id:             id,
-		conn:           conn,
-		sendWindow:     InitialWindow,
-		recvWindow:     InitialWindow,
-		recvBuf:        make(chan []byte, 64),
-		pendingData:    make(map[uint32][]byte),
-		unackedPackets: make(map[uint32]*unackedPacket),
-		congestion:     NewCongestionControl(),
+		id:      id,
+		conn:    conn,
+		sendBuf: make(chan []byte, 1024),
+		recvBuf: make(chan []byte, 1024),
+		unacked: make(map[uint32]*unackedPacket),
 	}
 	
-	go s.receiveLoop()
+	s.sendWindow.Store(1024) // ظرفیت اولیه پنجره ارسال
+	s.recvWindow.Store(1024) // ظرفیت اولیه پنجره دریافت
+
+	// شروع حلقه مانیتورینگ برای ارسال مجدد در پس‌زمینه
 	go s.retransmitLoop()
-	
+
 	return s
 }
 
-// Write با segmentation برای payload های بزرگ
-func (s *Stream) Write(data []byte) (int, error) {
+// -----------------------------------------------------------------
+// توابع اصلی استریم (Write, Read, Close)
+// -----------------------------------------------------------------
+
+func (s *Stream) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, ErrStreamClosed
 	}
-	
-	totalWritten := 0
-	offset := 0
-	
-	for offset < len(data) {
-		// محاسبه chunk size
-		chunkSize := min(MaxPayloadSize, len(data)-offset)
-		chunk := data[offset : offset+chunkSize]
-		
-		// منتظر window space
-		for {
-			s.unackedMu.RLock()
-			unacked := uint32(len(s.unackedPackets))
-			s.unackedMu.RUnlock()
-			
-			if unacked < atomic.LoadUint32(&s.sendWindow) {
-				break
-			}
-			
-			// backpressure
-			time.Sleep(10 * time.Millisecond)
-			
-			if s.closed.Load() {
-				return totalWritten, ErrStreamClosed
-			}
-		}
-		
-		// ارسال chunk
-		seq := atomic.AddUint32(&s.sendSeq, 1)
-		
-		header := &PacketHeader{
-			Version:    ProtocolVersion,
-			Type:       PacketTypeStreamData,
-			StreamID:   s.id,
-			Sequence:   seq,
-			Timestamp:  time.Now().UnixNano(),
-			WindowSize: uint16(atomic.LoadUint32(&s.recvWindow)),
-			Flags:      0,
-		}
-		
-		// ذخیره برای retransmission
-		s.unackedMu.Lock()
-		s.unackedPackets[seq] = &unackedPacket{
-			header:   header,
-			payload:  append([]byte(nil), chunk...),
-			sentTime: time.Now(),
-			retries:  0,
-		}
-		s.unackedMu.Unlock()
-		
-		// ارسال
-		if err := s.conn.sendPacket(header, chunk); err != nil {
-			return totalWritten, err
-		}
-		
-		totalWritten += chunkSize
-		offset += chunkSize
+
+	// کنترل جریان: اگر پنجره ارسال پر شده باشد، منتظر می‌مانیم یا خطا می‌دهیم
+	// در یک پیاده‌سازی پیشرفته‌تر، اینجا باید از channel برای بلاک کردن استفاده شود
+	if s.sendWindow.Load() == 0 {
+		return 0, ErrWindowFull
 	}
-	
-	return totalWritten, nil
+
+	seq := s.sendSeq.Add(1)
+
+	// ساخت هدر (باید مطابق با ساختار protocol.go شما باشد)
+	// فرض بر این است که PacketHeader در protocol.go تعریف شده است
+	header := &PacketHeader{
+		Version:    ProtocolVersion, 
+		Type:       PacketTypeStreamData, 
+		StreamID:   s.id,
+		Sequence:   seq,
+		Timestamp:  time.Now().UnixNano(),
+		WindowSize: uint16(s.recvWindow.Load()),
+	}
+
+	// کپی کردن داده‌ها برای جلوگیری از تغییر ناخواسته توسط لایه‌های بالاتر
+	dataCopy := make([]byte, len(p))
+	copy(dataCopy, p)
+
+	// ذخیره بسته در لیست بسته‌های در انتظار ACK
+	s.unackedMu.Lock()
+	s.unacked[seq] = &unackedPacket{
+		header:  nil, // اگر متد header.Bytes() دارید اینجا قرار دهید
+		data:    dataCopy,
+		sentAt:  time.Now(),
+		seq:     seq,
+		retries: 0,
+	}
+	s.unackedMu.Unlock()
+
+	// کاهش ظرفیت پنجره ارسال به اندازه 1
+	s.sendWindow.Add(^uint32(0)) 
+
+	// ارسال بسته به لایه Connection
+	err := s.conn.sendPacket(header, dataCopy)
+	if err != nil {
+		return 0, err
+	}
+
+	return len(p), nil
 }
 
-// Read با reassembly
-func (s *Stream) Read(buf []byte) (int, error) {
+func (s *Stream) Read(p []byte) (int, error) {
 	if s.closed.Load() && len(s.recvBuf) == 0 {
-		return 0, io.EOF
+		return 0, ErrStreamClosed
 	}
-	
+
 	select {
-	case data := <-s.recvBuf:
-		n := copy(buf, data)
+	case data, ok := <-s.recvBuf:
+		if !ok {
+			return 0, ErrStreamClosed
+		}
+		
+		// کپی داده‌های دریافت شده به بافر کاربر
+		n := copy(p, data)
+		
+		// باز کردن فضای پنجره دریافت پس از خواندن برنامه
+		s.recvWindow.Add(1) 
+		
 		return n, nil
 		
-	case <-time.After(30 * time.Second):
-		if s.closed.Load() {
-			return 0, io.EOF
-		}
+	case <-time.After(ConnectionTimeout):
 		return 0, errors.New("read timeout")
 	}
 }
 
-func (s *Stream) handlePacket(header *PacketHeader, payload []byte) {
-	switch header.Type {
-	case PacketTypeStreamData:
-		s.handleData(header, payload)
-	case PacketTypeStreamAck:
-		s.handleAck(header)
-	case PacketTypeStreamClose:
-		s.Close()
+func (s *Stream) Close() error {
+	if s.closed.Swap(true) {
+		return ErrStreamClosed
 	}
-}
 
-// handleData با out-of-order buffering
-func (s *Stream) handleData(header *PacketHeader, payload []byte) {
-	expectedSeq := atomic.LoadUint32(&s.recvSeq) + 1
-	
-	// ارسال ACK
-	ackHeader := &PacketHeader{
-		Version:    ProtocolVersion,
-		Type:       PacketTypeStreamAck,
-		StreamID:   s.id,
-		Sequence:   header.Sequence,
-		Timestamp:  time.Now().UnixNano(),
-		WindowSize: uint16(atomic.LoadUint32(&s.recvWindow)),
-	}
-	s.conn.sendPacket(ackHeader, nil)
-	
-	s.pendingMu.Lock()
-	defer s.pendingMu.Unlock()
-	
-	if header.Sequence < expectedSeq {
-		// duplicate, ignore
-		return
-	}
-	
-	if header.Sequence == expectedSeq {
-		// in-order packet
-		atomic.StoreUint32(&s.recvSeq, header.Sequence)
-		
-		// ارسال به buffer با backpressure
-		select {
-		case s.recvBuf <- append([]byte(nil), payload...):
-		default:
-			// buffer full - این یک مشکل جدی است
-			// در production باید log بشه
-		}
-		
-		// چک کردن pending packets
-		s.deliverPendingPackets()
-		
-	} else {
-		// out-of-order packet - buffer کن
-		if len(s.pendingData) < 100 { // محدودیت buffer
-			s.pendingData[header.Sequence] = append([]byte(nil), payload...)
-		}
-	}
-}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-func (s *Stream) deliverPendingPackets() {
-	for {
-		nextSeq := atomic.LoadUint32(&s.recvSeq) + 1
-		data, ok := s.pendingData[nextSeq]
-		if !ok {
-			break
-		}
-		
-		delete(s.pendingData, nextSeq)
-		atomic.StoreUint32(&s.recvSeq, nextSeq)
-		
-		select {
-		case s.recvBuf <- data:
-		default:
-			// buffer full
-			return
-		}
-	}
-}
+	// بستن کانال‌ها به صورت امن
+	close(s.sendBuf)
+	close(s.recvBuf)
 
-func (s *Stream) handleAck(header *PacketHeader) {
+	// پاکسازی لیست Unacked
 	s.unackedMu.Lock()
-	delete(s.unackedPackets, header.Sequence)
+	s.unacked = make(map[uint32]*unackedPacket)
 	s.unackedMu.Unlock()
-	
-	// update window
-	if header.WindowSize > 0 {
-		atomic.StoreUint32(&s.sendWindow, uint32(header.WindowSize))
+
+	return nil
+}
+
+// -----------------------------------------------------------------
+// توابع مدیریت قابلیت اطمینان (ACK و Retransmission)
+// -----------------------------------------------------------------
+
+// HandleAck توسط Connection فراخوانی می‌شود وقتی پکت ACK برای این استریم می‌رسد
+func (s *Stream) HandleAck(ackSeq uint32, windowSize uint16) {
+	s.unackedMu.Lock()
+	defer s.unackedMu.Unlock()
+
+	if _, exists := s.unacked[ackSeq]; exists {
+		delete(s.unacked, ackSeq) // حذف بسته تایید شده
+		s.sendWindow.Add(1)       // افزایش ظرفیت پنجره ارسال
 	}
-	
-	// update congestion control
-	s.congestion.OnAck()
+
+	// به‌روزرسانی پنجره ارسال با توجه به ظرفیت اعلام شده گیرنده
+	s.sendWindow.Store(uint32(windowSize))
 }
 
 func (s *Stream) retransmitLoop() {
-	ticker := time.NewTicker(RetransmitTimeout)
+	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
-	
-	for !s.closed.Load() {
-		<-ticker.C
-		
+
+	timeout := 400 * time.Millisecond // زمان انتظار قبل از ارسال مجدد
+
+	for range ticker.C {
+		if s.closed.Load() {
+			return
+		}
+
 		now := time.Now()
 		s.unackedMu.Lock()
 		
-		for seq, pkt := range s.unackedPackets {
-			if now.Sub(pkt.sentTime) > RetransmitTimeout {
-				if pkt.retries >= MaxRetransmits {
-					// give up
-					delete(s.unackedPackets, seq)
-					continue
+		for seq, pkt := range s.unacked {
+			if now.Sub(pkt.sentAt) > timeout {
+				if pkt.retries >= 5 {
+					// اگر ۵ بار تلاش کردیم و جواب نیامد، استریم قطع می‌شود
+					s.unackedMu.Unlock()
+					s.Close()
+					return
 				}
-				
-				// retransmit
-				pkt.sentTime = now
+
 				pkt.retries++
-				s.conn.sendPacket(pkt.header, pkt.payload)
+				pkt.sentAt = now
+				
+				// ساخت مجدد هدر برای ارسال مجدد (جهت آپدیت تایم‌استمپ)
+				header := &PacketHeader{
+					Version:    ProtocolVersion, 
+					Type:       PacketTypeStreamData, 
+					StreamID:   s.id,
+					Sequence:   seq,
+					Timestamp:  time.Now().UnixNano(),
+					WindowSize: uint16(s.recvWindow.Load()),
+				}
+
+				// ارسال مجدد بدون بلاک کردن در صورت امکان
+				go s.conn.sendPacket(header, pkt.data)
 			}
 		}
-		
 		s.unackedMu.Unlock()
 	}
 }
 
-func (s *Stream) receiveLoop() {
-	// این loop توسط Connection.handleIncoming فراخوانی میشه
+// -----------------------------------------------------------------
+// ساختارهای اتصال و کنترل ازدحام
+// -----------------------------------------------------------------
+
+type Connection struct {
+	transport       *SpaceShuttleConn // تعریف شده در protocol.go
+	streams         map[uint32]*Stream
+	nextID          atomic.Uint32
+	closed          atomic.Bool
+	mu              sync.RWMutex
+	congestion      *CongestionControl
+	incomingStreams chan *Stream
 }
 
-func (s *Stream) Close() error {
-	if !s.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	
-	s.closeMu.Lock()
-	defer s.closeMu.Unlock()
-	
-	header := &PacketHeader{
-		Version:   ProtocolVersion,
-		Type:      PacketTypeStreamClose,
-		StreamID:  s.id,
-		Timestamp: time.Now().UnixNano(),
-	}
-	
-	s.conn.sendPacket(header, nil)
-	close(s.recvBuf)
-	
+// متدهای مرتبط با Connection (مانند sendPacket) اینجا قرار می‌گیرند...
+func (c *Connection) sendPacket(header *PacketHeader, payload []byte) error {
+	// پیاده‌سازی اتصال به transport.SendPacket
+	// ...
 	return nil
 }
 
-// Connection
-type Connection struct {
-	transport       *SpaceShuttleConn
-	streams         map[uint32]*Stream
-	streamsMu       sync.RWMutex
-	nextStreamID    uint32
-	incomingStreams chan *Stream
-	closed          atomic.Bool
-}
-
-func NewConnection(transport *SpaceShuttleConn) *Connection {
-	c := &Connection{
-		transport:       transport,
-		streams:         make(map[uint32]*Stream),
-		incomingStreams: make(chan *Stream, 16),
-	}
-	
-	go c.handleIncoming()
-	
-	return c
-}
-
-func (c *Connection) sendPacket(header *PacketHeader, payload []byte) error {
-	// FIX: حذف آرگومان سوم که اشتباه بود
-	return c.transport.SendPacket(header, payload)
-}
-
-func (c *Connection) handleIncoming() {
-	for !c.closed.Load() {
-		header, payload, err := c.transport.RecvPacket()
-		if err != nil {
-			if c.closed.Load() {
-				return
-			}
-			continue
-		}
-		
-		// validation
-		if header.Version != ProtocolVersion {
-			continue
-		}
-		
-		c.streamsMu.RLock()
-		stream, exists := c.streams[header.StreamID]
-		c.streamsMu.RUnlock()
-		
-		if !exists {
-			if header.Type == PacketTypeStreamOpen {
-				stream = newStream(header.StreamID, c)
-				c.streamsMu.Lock()
-				c.streams[header.StreamID] = stream
-				c.streamsMu.Unlock()
-				
-				select {
-				case c.incomingStreams <- stream:
-				default:
-					// incoming queue full
-					stream.Close()
-				}
-			}
-			continue
-		}
-		
-		stream.handlePacket(header, payload)
-	}
-}
-
-func (c *Connection) OpenStream() (*Stream, error) {
-	if c.closed.Load() {
-		return nil, ErrConnectionClosed
-	}
-	
-	streamID := atomic.AddUint32(&c.nextStreamID, 1)
-	stream := newStream(streamID, c)
-	
-	c.streamsMu.Lock()
-	c.streams[streamID] = stream
-	c.streamsMu.Unlock()
-	
-	header := &PacketHeader{
-		Version:   ProtocolVersion,
-		Type:      PacketTypeStreamOpen,
-		StreamID:  streamID,
-		Timestamp: time.Now().UnixNano(),
-	}
-	
-	if err := c.sendPacket(header, nil); err != nil {
-		return nil, err
-	}
-	
-	return stream, nil
-}
-
-func (c *Connection) AcceptStream() (*Stream, error) {
-	select {
-	case stream := <-c.incomingStreams:
-		return stream, nil
-	case <-time.After(30 * time.Second):
-		return nil, errors.New("accept timeout")
-	}
-}
-
-func (c *Connection) Close() error {
-	if !c.closed.CompareAndSwap(false, true) {
-		return nil
-	}
-	
-	c.streamsMu.Lock()
-	for _, stream := range c.streams {
-		stream.Close()
-	}
-	c.streamsMu.Unlock()
-	
-	return c.transport.Close()
-}
-
-// CongestionControl
 type CongestionControl struct {
-	cwnd     uint32
-	ssthresh uint32
+	window   atomic.Uint32
+	ssthresh atomic.Uint32
+	rtt      atomic.Int64
+	rttVar   atomic.Int64
+	inFlight atomic.Uint32
+	lastAck  atomic.Int64
 	mu       sync.Mutex
-}
-
-func NewCongestionControl() *CongestionControl {
-	return &CongestionControl{
-		cwnd:     InitialWindow,
-		ssthresh: MaxWindow / 2,
-	}
-}
-
-func (cc *CongestionControl) OnAck() {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	
-	if cc.cwnd < cc.ssthresh {
-		// slow start
-		cc.cwnd++
-	} else {
-		// congestion avoidance
-		cc.cwnd += 1 / cc.cwnd
-	}
-	
-	if cc.cwnd > MaxWindow {
-		cc.cwnd = MaxWindow
-	}
-}
-
-func (cc *CongestionControl) OnLoss() {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	
-	cc.ssthresh = cc.cwnd / 2
-	cc.cwnd = MinWindow
-}
-
-func (cc *CongestionControl) Window() uint32 {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-	return cc.cwnd
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
