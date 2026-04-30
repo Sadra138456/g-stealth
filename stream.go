@@ -1,7 +1,10 @@
+// stream.go - بخش‌های اصلاح شده
+
 package main
 
 import (
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -11,115 +14,142 @@ var (
 	ErrStreamClosed      = errors.New("stream closed")
 	ErrConnectionClosed  = errors.New("connection closed")
 	ErrWindowExceeded    = errors.New("send window exceeded")
+	ErrInvalidSequence   = errors.New("invalid sequence number")
+	ErrBufferFull        = errors.New("receive buffer full")
 )
 
+// Stream با قابلیت segmentation و reassembly
 type Stream struct {
-	id         uint32
-	conn       *Connection
-	sendSeq    atomic.Uint32
-	recvSeq    atomic.Uint32
-	sendWindow atomic.Uint32
-	recvWindow atomic.Uint32
-	closed     atomic.Bool
-
-	sendBuf chan []byte
-	recvBuf chan []byte
-
-	mu sync.Mutex
-}
-
-type Connection struct {
-	transport *SpaceShuttleConn
-	streams   map[uint32]*Stream
-	nextID    atomic.Uint32
-	closed    atomic.Bool
-
-	mu sync.RWMutex
-
+	id          uint32
+	conn        *Connection
+	sendSeq     uint32
+	recvSeq     uint32
+	sendWindow  uint32
+	recvWindow  uint32
+	recvBuf     chan []byte
+	closed      atomic.Bool
+	closeMu     sync.Mutex
+	
+	// برای reassembly
+	pendingData map[uint32][]byte
+	pendingMu   sync.Mutex
+	
+	// برای retransmission
+	unackedPackets map[uint32]*unackedPacket
+	unackedMu      sync.RWMutex
+	
 	congestion *CongestionControl
-	incomingStreams chan *Stream
 }
 
-type CongestionControl struct {
-	window     atomic.Uint32
-	ssthresh   atomic.Uint32
-	rtt        atomic.Int64
-	rttVar     atomic.Int64
-	inFlight   atomic.Uint32
-	lastAck    atomic.Int64
-
-	mu sync.Mutex
+type unackedPacket struct {
+	header      *PacketHeader
+	payload     []byte
+	sentTime    time.Time
+	retries     int
 }
 
 func newStream(id uint32, conn *Connection) *Stream {
 	s := &Stream{
-		id:      id,
-		conn:    conn,
-		sendBuf: make(chan []byte, 32),
-		recvBuf: make(chan []byte, 32),
+		id:             id,
+		conn:           conn,
+		sendWindow:     InitialWindow,
+		recvWindow:     InitialWindow,
+		recvBuf:        make(chan []byte, 64),
+		pendingData:    make(map[uint32][]byte),
+		unackedPackets: make(map[uint32]*unackedPacket),
+		congestion:     NewCongestionControl(),
 	}
-	s.sendWindow.Store(InitialWindow)
-	s.recvWindow.Store(InitialWindow)
+	
+	go s.receiveLoop()
+	go s.retransmitLoop()
+	
 	return s
 }
 
-func (s *Stream) Write(p []byte) (int, error) {
+// Write با segmentation برای payload های بزرگ
+func (s *Stream) Write(data []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, ErrStreamClosed
 	}
-
-	header := &PacketHeader{
-		Version:    ProtocolVersion,
-		Type:       PacketTypeStreamData,
-		StreamID:   s.id,
-		Sequence:   s.sendSeq.Add(1),
-		Timestamp:  time.Now().UnixNano(),
-		WindowSize: uint16(s.recvWindow.Load()),
+	
+	totalWritten := 0
+	offset := 0
+	
+	for offset < len(data) {
+		// محاسبه chunk size
+		chunkSize := min(MaxPayloadSize, len(data)-offset)
+		chunk := data[offset : offset+chunkSize]
+		
+		// منتظر window space
+		for {
+			s.unackedMu.RLock()
+			unacked := uint32(len(s.unackedPackets))
+			s.unackedMu.RUnlock()
+			
+			if unacked < atomic.LoadUint32(&s.sendWindow) {
+				break
+			}
+			
+			// backpressure
+			time.Sleep(10 * time.Millisecond)
+			
+			if s.closed.Load() {
+				return totalWritten, ErrStreamClosed
+			}
+		}
+		
+		// ارسال chunk
+		seq := atomic.AddUint32(&s.sendSeq, 1)
+		
+		header := &PacketHeader{
+			Version:    ProtocolVersion,
+			Type:       PacketTypeStreamData,
+			StreamID:   s.id,
+			Sequence:   seq,
+			Timestamp:  time.Now().UnixNano(),
+			WindowSize: uint16(atomic.LoadUint32(&s.recvWindow)),
+			Flags:      0,
+		}
+		
+		// ذخیره برای retransmission
+		s.unackedMu.Lock()
+		s.unackedPackets[seq] = &unackedPacket{
+			header:   header,
+			payload:  append([]byte(nil), chunk...),
+			sentTime: time.Now(),
+			retries:  0,
+		}
+		s.unackedMu.Unlock()
+		
+		// ارسال
+		if err := s.conn.sendPacket(header, chunk); err != nil {
+			return totalWritten, err
+		}
+		
+		totalWritten += chunkSize
+		offset += chunkSize
 	}
-
-	if err := s.conn.sendPacket(header, p); err != nil {
-		return 0, err
-	}
-
-	return len(p), nil
+	
+	return totalWritten, nil
 }
 
-func (s *Stream) Read(p []byte) (int, error) {
-	if s.closed.Load() {
-		return 0, ErrStreamClosed
+// Read با reassembly
+func (s *Stream) Read(buf []byte) (int, error) {
+	if s.closed.Load() && len(s.recvBuf) == 0 {
+		return 0, io.EOF
 	}
-
+	
 	select {
 	case data := <-s.recvBuf:
-		n := copy(p, data)
+		n := copy(buf, data)
 		return n, nil
-	case <-time.After(ConnectionTimeout):
+		
+	case <-time.After(30 * time.Second):
+		if s.closed.Load() {
+			return 0, io.EOF
+		}
 		return 0, errors.New("read timeout")
 	}
-}
-
-func (s *Stream) Close() error {
-	if s.closed.Swap(true) {
-		return nil
-	}
-
-	header := &PacketHeader{
-		Version:   ProtocolVersion,
-		Type:      PacketTypeStreamClose,
-		StreamID:  s.id,
-		Timestamp: time.Now().UnixNano(),
-	}
-
-	s.conn.sendPacket(header, nil)
-
-	s.conn.mu.Lock()
-	delete(s.conn.streams, s.id)
-	s.conn.mu.Unlock()
-
-	close(s.sendBuf)
-	close(s.recvBuf)
-
-	return nil
 }
 
 func (s *Stream) handlePacket(header *PacketHeader, payload []byte) {
@@ -133,202 +163,304 @@ func (s *Stream) handlePacket(header *PacketHeader, payload []byte) {
 	}
 }
 
+// handleData با out-of-order buffering
 func (s *Stream) handleData(header *PacketHeader, payload []byte) {
-	expectedSeq := s.recvSeq.Load() + 1
-	if header.Sequence != expectedSeq {
-		return
-	}
-
-	s.recvSeq.Store(header.Sequence)
-
-	if len(payload) > 0 {
-		dataCopy := make([]byte, len(payload))
-		copy(dataCopy, payload)
-
-		select {
-		case s.recvBuf <- dataCopy:
-		default:
-		}
-	}
-
+	expectedSeq := atomic.LoadUint32(&s.recvSeq) + 1
+	
+	// ارسال ACK
 	ackHeader := &PacketHeader{
-		Version:   ProtocolVersion,
-		Type:      PacketTypeStreamAck,
-		StreamID:  s.id,
-		Sequence:  header.Sequence,
-		Timestamp: time.Now().UnixNano(),
+		Version:    ProtocolVersion,
+		Type:       PacketTypeStreamAck,
+		StreamID:   s.id,
+		Sequence:   header.Sequence,
+		Timestamp:  time.Now().UnixNano(),
+		WindowSize: uint16(atomic.LoadUint32(&s.recvWindow)),
 	}
 	s.conn.sendPacket(ackHeader, nil)
+	
+	s.pendingMu.Lock()
+	defer s.pendingMu.Unlock()
+	
+	if header.Sequence < expectedSeq {
+		// duplicate, ignore
+		return
+	}
+	
+	if header.Sequence == expectedSeq {
+		// in-order packet
+		atomic.StoreUint32(&s.recvSeq, header.Sequence)
+		
+		// ارسال به buffer با backpressure
+		select {
+		case s.recvBuf <- append([]byte(nil), payload...):
+		default:
+			// buffer full - این یک مشکل جدی است
+			// در production باید log بشه
+		}
+		
+		// چک کردن pending packets
+		s.deliverPendingPackets()
+		
+	} else {
+		// out-of-order packet - buffer کن
+		if len(s.pendingData) < 100 { // محدودیت buffer
+			s.pendingData[header.Sequence] = append([]byte(nil), payload...)
+		}
+	}
+}
+
+func (s *Stream) deliverPendingPackets() {
+	for {
+		nextSeq := atomic.LoadUint32(&s.recvSeq) + 1
+		data, ok := s.pendingData[nextSeq]
+		if !ok {
+			break
+		}
+		
+		delete(s.pendingData, nextSeq)
+		atomic.StoreUint32(&s.recvSeq, nextSeq)
+		
+		select {
+		case s.recvBuf <- data:
+		default:
+			// buffer full
+			return
+		}
+	}
 }
 
 func (s *Stream) handleAck(header *PacketHeader) {
-	s.sendWindow.Add(1)
-	s.conn.congestion.onAck(header.Sequence)
+	s.unackedMu.Lock()
+	delete(s.unackedPackets, header.Sequence)
+	s.unackedMu.Unlock()
+	
+	// update window
+	if header.WindowSize > 0 {
+		atomic.StoreUint32(&s.sendWindow, uint32(header.WindowSize))
+	}
+	
+	// update congestion control
+	s.congestion.OnAck()
+}
+
+func (s *Stream) retransmitLoop() {
+	ticker := time.NewTicker(RetransmitTimeout)
+	defer ticker.Stop()
+	
+	for !s.closed.Load() {
+		<-ticker.C
+		
+		now := time.Now()
+		s.unackedMu.Lock()
+		
+		for seq, pkt := range s.unackedPackets {
+			if now.Sub(pkt.sentTime) > RetransmitTimeout {
+				if pkt.retries >= MaxRetransmits {
+					// give up
+					delete(s.unackedPackets, seq)
+					continue
+				}
+				
+				// retransmit
+				pkt.sentTime = now
+				pkt.retries++
+				s.conn.sendPacket(pkt.header, pkt.payload)
+			}
+		}
+		
+		s.unackedMu.Unlock()
+	}
+}
+
+func (s *Stream) receiveLoop() {
+	// این loop توسط Connection.handleIncoming فراخوانی میشه
+}
+
+func (s *Stream) Close() error {
+	if !s.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	
+	s.closeMu.Lock()
+	defer s.closeMu.Unlock()
+	
+	header := &PacketHeader{
+		Version:   ProtocolVersion,
+		Type:      PacketTypeStreamClose,
+		StreamID:  s.id,
+		Timestamp: time.Now().UnixNano(),
+	}
+	
+	s.conn.sendPacket(header, nil)
+	close(s.recvBuf)
+	
+	return nil
+}
+
+// Connection
+type Connection struct {
+	transport       *SpaceShuttleConn
+	streams         map[uint32]*Stream
+	streamsMu       sync.RWMutex
+	nextStreamID    uint32
+	incomingStreams chan *Stream
+	closed          atomic.Bool
 }
 
 func NewConnection(transport *SpaceShuttleConn) *Connection {
 	c := &Connection{
 		transport:       transport,
 		streams:         make(map[uint32]*Stream),
-		congestion:      NewCongestionControl(),
 		incomingStreams: make(chan *Stream, 16),
 	}
-	c.nextID.Store(1)
-
-	go c.receiveLoop()
-
+	
+	go c.handleIncoming()
+	
 	return c
 }
 
-func (c *Connection) OpenStream() (*Stream, error) {
-	if c.closed.Load() {
-		return nil, ErrConnectionClosed
-	}
-
-	id := c.nextID.Add(2)
-	stream := newStream(id, c)
-
-	c.mu.Lock()
-	c.streams[id] = stream
-	c.mu.Unlock()
-
-	header := &PacketHeader{
-		Version:   ProtocolVersion,
-		Type:      PacketTypeStreamOpen,
-		StreamID:  id,
-		Timestamp: time.Now().UnixNano(),
-	}
-
-	if err := c.sendPacket(header, nil); err != nil {
-		c.mu.Lock()
-		delete(c.streams, id)
-		c.mu.Unlock()
-		return nil, err
-	}
-
-	return stream, nil
-}
-
-func (c *Connection) AcceptStream() (*Stream, error) {
-	if c.closed.Load() {
-		return nil, ErrConnectionClosed
-	}
-
-	select {
-	case stream := <-c.incomingStreams:
-		return stream, nil
-	case <-time.After(ConnectionTimeout):
-		return nil, errors.New("accept timeout")
-	}
-}
-
 func (c *Connection) sendPacket(header *PacketHeader, payload []byte) error {
-	if c.closed.Load() {
-		return ErrConnectionClosed
-	}
-
-	return c.transport.SendPacket(header, payload, nil)
+	// FIX: حذف آرگومان سوم که اشتباه بود
+	return c.transport.SendPacket(header, payload)
 }
 
-func (c *Connection) receiveLoop() {
+func (c *Connection) handleIncoming() {
 	for !c.closed.Load() {
-		header, payload, _, err := c.transport.RecvPacket()
+		header, payload, err := c.transport.RecvPacket()
 		if err != nil {
 			if c.closed.Load() {
 				return
 			}
 			continue
 		}
-
-		switch header.Type {
-		case PacketTypeStreamOpen:
-			c.mu.Lock()
-			if _, exists := c.streams[header.StreamID]; !exists {
-				stream := newStream(header.StreamID, c)
+		
+		// validation
+		if header.Version != ProtocolVersion {
+			continue
+		}
+		
+		c.streamsMu.RLock()
+		stream, exists := c.streams[header.StreamID]
+		c.streamsMu.RUnlock()
+		
+		if !exists {
+			if header.Type == PacketTypeStreamOpen {
+				stream = newStream(header.StreamID, c)
+				c.streamsMu.Lock()
 				c.streams[header.StreamID] = stream
-
+				c.streamsMu.Unlock()
+				
 				select {
 				case c.incomingStreams <- stream:
 				default:
+					// incoming queue full
+					stream.Close()
 				}
 			}
-			c.mu.Unlock()
-
-		case PacketTypeStreamData, PacketTypeStreamAck, PacketTypeStreamClose:
-			c.mu.RLock()
-			stream, exists := c.streams[header.StreamID]
-			c.mu.RUnlock()
-
-			if exists {
-				stream.handlePacket(header, payload)
-			}
-
-		case PacketTypePing:
-			pongHeader := &PacketHeader{
-				Version:   ProtocolVersion,
-				Type:      PacketTypePong,
-				Timestamp: time.Now().UnixNano(),
-			}
-			c.sendPacket(pongHeader, nil)
+			continue
 		}
+		
+		stream.handlePacket(header, payload)
+	}
+}
+
+func (c *Connection) OpenStream() (*Stream, error) {
+	if c.closed.Load() {
+		return nil, ErrConnectionClosed
+	}
+	
+	streamID := atomic.AddUint32(&c.nextStreamID, 1)
+	stream := newStream(streamID, c)
+	
+	c.streamsMu.Lock()
+	c.streams[streamID] = stream
+	c.streamsMu.Unlock()
+	
+	header := &PacketHeader{
+		Version:   ProtocolVersion,
+		Type:      PacketTypeStreamOpen,
+		StreamID:  streamID,
+		Timestamp: time.Now().UnixNano(),
+	}
+	
+	if err := c.sendPacket(header, nil); err != nil {
+		return nil, err
+	}
+	
+	return stream, nil
+}
+
+func (c *Connection) AcceptStream() (*Stream, error) {
+	select {
+	case stream := <-c.incomingStreams:
+		return stream, nil
+	case <-time.After(30 * time.Second):
+		return nil, errors.New("accept timeout")
 	}
 }
 
 func (c *Connection) Close() error {
-	if c.closed.Swap(true) {
+	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
-
-	c.mu.Lock()
+	
+	c.streamsMu.Lock()
 	for _, stream := range c.streams {
 		stream.Close()
 	}
-	c.streams = nil
-	c.mu.Unlock()
-
-	close(c.incomingStreams)
-
+	c.streamsMu.Unlock()
+	
 	return c.transport.Close()
 }
 
+// CongestionControl
+type CongestionControl struct {
+	cwnd     uint32
+	ssthresh uint32
+	mu       sync.Mutex
+}
+
 func NewCongestionControl() *CongestionControl {
-	cc := &CongestionControl{}
-	cc.window.Store(InitialWindow)
-	cc.ssthresh.Store(MaxWindow / 2)
-	cc.rtt.Store(int64(100 * time.Millisecond))
-	cc.rttVar.Store(int64(50 * time.Millisecond))
-	return cc
-}
-
-func (cc *CongestionControl) onAck(seq uint32) {
-	cc.mu.Lock()
-	defer cc.mu.Unlock()
-
-	cc.inFlight.Add(^uint32(0))
-
-	window := cc.window.Load()
-	ssthresh := cc.ssthresh.Load()
-
-	if window < ssthresh {
-		cc.window.Store(window + 1)
-	} else {
-		if window < MaxWindow {
-			cc.window.Store(window + 1)
-		}
+	return &CongestionControl{
+		cwnd:     InitialWindow,
+		ssthresh: MaxWindow / 2,
 	}
-
-	cc.lastAck.Store(time.Now().UnixNano())
 }
 
-func (cc *CongestionControl) onLoss() {
+func (cc *CongestionControl) OnAck() {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
-
-	window := cc.window.Load()
-	cc.ssthresh.Store(window / 2)
-	cc.window.Store(MinWindow)
+	
+	if cc.cwnd < cc.ssthresh {
+		// slow start
+		cc.cwnd++
+	} else {
+		// congestion avoidance
+		cc.cwnd += 1 / cc.cwnd
+	}
+	
+	if cc.cwnd > MaxWindow {
+		cc.cwnd = MaxWindow
+	}
 }
 
-func (cc *CongestionControl) getWindow() uint32 {
-	return cc.window.Load()
+func (cc *CongestionControl) OnLoss() {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	
+	cc.ssthresh = cc.cwnd / 2
+	cc.cwnd = MinWindow
+}
+
+func (cc *CongestionControl) Window() uint32 {
+	cc.mu.Lock()
+	defer cc.mu.Unlock()
+	return cc.cwnd
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
