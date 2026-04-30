@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,7 @@ import (
 type Client struct {
 	serverAddr string
 	proxyAddr  string
+	password   string
 	conn       *Connection
 	streams    map[uint32]*Stream
 	streamsMu  sync.RWMutex
@@ -20,16 +22,28 @@ type Client struct {
 	idMu       sync.Mutex
 }
 
-func NewClient(serverAddr, proxyAddr string) *Client {
+func NewClient(serverAddr, proxyAddr, password string) *Client {
 	return &Client{
 		serverAddr: serverAddr,
 		proxyAddr:  proxyAddr,
+		password:   password,
 		streams:    make(map[uint32]*Stream),
 		nextID:     1,
 	}
 }
 
 func (c *Client) Start() error {
+	// Decode password to key
+	if len(c.password) != 64 {
+		return fmt.Errorf("password must be 64 hex characters (32 bytes)")
+	}
+	
+	key := make([]byte, 32)
+	_, err := hex.Decode(key, []byte(c.password))
+	if err != nil {
+		return fmt.Errorf("invalid hex password: %w", err)
+	}
+
 	// Connect to server
 	udpAddr, err := net.ResolveUDPAddr("udp", c.serverAddr)
 	if err != nil {
@@ -42,7 +56,7 @@ func (c *Client) Start() error {
 	}
 
 	// Create encrypted connection
-	transport, err := NewSpaceShuttleConn(udpConn, testKey)
+	transport, err := NewSpaceShuttleConn(udpConn, key)
 	if err != nil {
 		udpConn.Close()
 		return fmt.Errorf("create transport: %w", err)
@@ -222,8 +236,8 @@ func (c *Client) createStream() (*Stream, error) {
 		conn:            c.conn,
 		sendSeq:         0,
 		recvSeq:         0,
-		sendWindow:      InitialWindowSize,
-		recvWindow:      InitialWindowSize,
+		sendWindow:      InitialWindow,
+		recvWindow:      InitialWindow,
 		recvBuf:         make(chan []byte, 256),
 		pendingData:     make(map[uint32][]byte),
 		unackedPackets:  make(map[uint32]*unackedPacket),
@@ -238,11 +252,11 @@ func (c *Client) createStream() (*Stream, error) {
 	// Send SYN
 	header := &PacketHeader{
 		Version:    ProtocolVersion,
-		Type:       PacketTypeSYN,
+		Type:       PacketTypeStreamOpen,
 		StreamID:   streamID,
 		Sequence:   0,
 		Timestamp:  uint32(time.Now().Unix()),
-		WindowSize: InitialWindowSize,
+		WindowSize: InitialWindow,
 		Flags:      0,
 	}
 
