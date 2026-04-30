@@ -7,18 +7,16 @@ import (
 	"time"
 )
 
-// فرض بر این است که این ثابت‌ها در protocol.go تعریف شده‌اند. 
-// اگر نام آن‌ها متفاوت است، لطفاً نام‌ها را مطابق با protocol.go تغییر دهید.
+// فرض بر این است که این مقادیر در protocol.go تعریف شده‌اند.
 const (
 	PacketTypeStreamData = 1
 	PacketTypeAck        = 2
 	PacketTypeClose      = 3
-	// ProtocolVersion = 1 // فرض بر وجود در protocol.go
+	ProtocolVersion      = 1
 )
 
 var (
 	ErrStreamClosed   = errors.New("stream closed")
-	ErrWindowFull     = errors.New("send window is full")
 	ErrConnClosed     = errors.New("connection closed")
 	ConnectionTimeout = 30 * time.Second
 )
@@ -52,28 +50,37 @@ type Stream struct {
 	id         uint32
 	conn       *Connection
 	sendSeq    atomic.Uint32
-	recvSeq    atomic.Uint32
+	recvSeq    atomic.Uint32 // شماره توالی بعدی که انتظار داریم بخوانیم
 	sendWindow atomic.Uint32
 	recvWindow atomic.Uint32
 	closed     atomic.Bool
 
 	sendBuf chan []byte
-	recvBuf chan []byte
+	recvBuf chan []byte // بافر دیتای مرتب شده برای خواندن توسط برنامه
 	mu      sync.Mutex
+
+	// مکانیزم مسدودسازی برای Flow Control
+	windowCond *sync.Cond
 
 	unacked   map[uint32]*unackedPacket
 	unackedMu sync.Mutex
+
+	// بافر مرتب‌سازی (Reordering Buffer)
+	reorderBuf map[uint32][]byte
+	reorderMu  sync.Mutex
 }
 
 func newStream(id uint32, conn *Connection) *Stream {
 	s := &Stream{
-		id:      id,
-		conn:    conn,
-		sendBuf: make(chan []byte, 1024),
-		recvBuf: make(chan []byte, 1024),
-		unacked: make(map[uint32]*unackedPacket),
+		id:         id,
+		conn:       conn,
+		sendBuf:    make(chan []byte, 1024),
+		recvBuf:    make(chan []byte, 1024),
+		unacked:    make(map[uint32]*unackedPacket),
+		reorderBuf: make(map[uint32][]byte),
 	}
-	
+	s.windowCond = sync.NewCond(&s.mu)
+
 	s.sendWindow.Store(1024)
 	s.recvWindow.Store(1024)
 
@@ -88,15 +95,22 @@ func (s *Stream) Write(p []byte) (int, error) {
 		return 0, ErrStreamClosed
 	}
 
-	if s.sendWindow.Load() == 0 {
-		return 0, ErrWindowFull // در سیستم‌های پیشرفته اینجا باید بلاک شود تا پنجره باز شود
+	s.mu.Lock()
+	// تا زمانی که ظرفیت پنجره 0 است، تابع مسدود می‌شود
+	for s.sendWindow.Load() == 0 {
+		if s.closed.Load() {
+			s.mu.Unlock()
+			return 0, ErrStreamClosed
+		}
+		s.windowCond.Wait()
 	}
+	s.mu.Unlock()
 
 	seq := s.sendSeq.Add(1)
 
 	header := &PacketHeader{
-		Version:    ProtocolVersion, 
-		Type:       PacketTypeStreamData, 
+		Version:    ProtocolVersion,
+		Type:       PacketTypeStreamData,
 		StreamID:   s.id,
 		Sequence:   seq,
 		Timestamp:  time.Now().UnixNano(),
@@ -106,7 +120,6 @@ func (s *Stream) Write(p []byte) (int, error) {
 	dataCopy := make([]byte, len(p))
 	copy(dataCopy, p)
 
-	// ثبت بسته برای پیگیری ACK
 	s.unackedMu.Lock()
 	s.unacked[seq] = &unackedPacket{
 		data:    dataCopy,
@@ -136,11 +149,11 @@ func (s *Stream) Read(p []byte) (int, error) {
 		if !ok {
 			return 0, ErrStreamClosed
 		}
-		
+
 		n := copy(p, data)
 		s.recvWindow.Add(1) // آزادسازی ظرفیت بافر دریافت
 		return n, nil
-		
+
 	case <-time.After(ConnectionTimeout):
 		return 0, errors.New("read timeout")
 	}
@@ -152,10 +165,11 @@ func (s *Stream) Close() error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	close(s.sendBuf)
 	close(s.recvBuf)
+	// بیدار کردن Write در صورت مسدود بودن هنگام بستن
+	s.windowCond.Broadcast()
+	s.mu.Unlock()
 
 	s.unackedMu.Lock()
 	s.unacked = make(map[uint32]*unackedPacket)
@@ -176,14 +190,55 @@ func (s *Stream) Close() error {
 
 func (s *Stream) HandleAck(ackSeq uint32, windowSize uint16) {
 	s.unackedMu.Lock()
-	defer s.unackedMu.Unlock()
-
 	if _, exists := s.unacked[ackSeq]; exists {
 		delete(s.unacked, ackSeq)
 		s.sendWindow.Add(1)
 	}
+	s.unackedMu.Unlock()
 
 	s.sendWindow.Store(uint32(windowSize))
+
+	// بیدار کردن تابع Write که به دلیل پر بودن پنجره متوقف شده بود
+	s.windowCond.Broadcast()
+}
+
+func (s *Stream) HandleIncomingData(seq uint32, payload []byte) {
+	s.reorderMu.Lock()
+	defer s.reorderMu.Unlock()
+
+	expectedSeq := s.recvSeq.Load() + 1
+
+	// اگر بسته قدیمی است (احتمالاً تکراری است)، آن را نادیده می‌گیریم
+	if seq < expectedSeq {
+		return
+	}
+
+	// ذخیره بسته در بافر مرتب‌سازی
+	s.reorderBuf[seq] = payload
+
+	// انتقال بسته‌های مرتب‌شده متوالی به recvBuf
+	for {
+		data, ok := s.reorderBuf[expectedSeq]
+		if !ok {
+			break // بسته بعدی هنوز نرسیده است
+		}
+
+		// بررسی ظرفیت بافر دریافت
+		if s.recvWindow.Load() > 0 {
+			select {
+			case s.recvBuf <- data:
+				s.recvSeq.Store(expectedSeq)
+				s.recvWindow.Add(^uint32(0)) // کاهش ظرفیت بافر دریافت
+				delete(s.reorderBuf, expectedSeq)
+				expectedSeq++
+			default:
+				// بافر چنل پر است
+				return
+			}
+		} else {
+			break // پنجره دریافت برنامه بسته است
+		}
+	}
 }
 
 func (s *Stream) retransmitLoop() {
@@ -199,7 +254,7 @@ func (s *Stream) retransmitLoop() {
 
 		now := time.Now()
 		s.unackedMu.Lock()
-		
+
 		for seq, pkt := range s.unacked {
 			if now.Sub(pkt.sentAt) > timeout {
 				if pkt.retries >= 5 {
@@ -211,10 +266,10 @@ func (s *Stream) retransmitLoop() {
 
 				pkt.retries++
 				pkt.sentAt = now
-				
+
 				header := &PacketHeader{
-					Version:    ProtocolVersion, 
-					Type:       PacketTypeStreamData, 
+					Version:    ProtocolVersion,
+					Type:       PacketTypeStreamData,
 					StreamID:   s.id,
 					Sequence:   seq,
 					Timestamp:  time.Now().UnixNano(),
@@ -233,7 +288,7 @@ func (s *Stream) retransmitLoop() {
 // =================================================================
 
 type Connection struct {
-	transport       *SpaceShuttleConn // فرض بر وجود SpaceShuttleConn در protocol.go
+	transport       *SpaceShuttleConn
 	streams         map[uint32]*Stream
 	nextID          atomic.Uint32
 	closed          atomic.Bool
@@ -249,7 +304,7 @@ func NewConnection(transport *SpaceShuttleConn) *Connection {
 		incomingStreams: make(chan *Stream, 128),
 		congestion:      &CongestionControl{},
 	}
-	
+
 	// شروع گوش دادن به پکت‌های ورودی از شبکه
 	go c.readLoop()
 	return c
@@ -259,21 +314,19 @@ func (c *Connection) sendPacket(header *PacketHeader, payload []byte) error {
 	if c.closed.Load() {
 		return ErrConnClosed
 	}
-	// فرض بر این است که SendPacket در protocol.go پیاده‌سازی شده و هدر و پی‌لود را می‌گیرد
 	return c.transport.SendPacket(header, payload)
 }
 
-// readLoop پکت‌ها را از لایه Transport می‌خواند و به استریم مناسب هدایت می‌کند (Demultiplexing)
+// readLoop پکت‌ها را می‌خواند و به استریم مناسب هدایت می‌کند (Demultiplexing)
 func (c *Connection) readLoop() {
 	for {
 		if c.closed.Load() {
 			return
 		}
 
-		// فرض می‌کنیم RecvPacket در protocol.go هدر و داده را برمی‌گرداند
-		header, payload, err := c.transport.RecvPacket()
+		header, payload, _, err := c.transport.RecvPacket()
 		if err != nil {
-			continue // در حالت واقعی ممکن است بخواهید خطا را مدیریت کنید یا کانکشن را ببندید
+			continue
 		}
 
 		c.mu.RLock()
@@ -283,16 +336,15 @@ func (c *Connection) readLoop() {
 		switch header.Type {
 		case PacketTypeStreamData:
 			if !exists {
-				// ایجاد استریم جدید در صورت عدم وجود (مناسب برای سرور)
+				// ایجاد استریم جدید
 				stream = newStream(header.StreamID, c)
 				c.mu.Lock()
 				c.streams[header.StreamID] = stream
 				c.mu.Unlock()
-				
+
 				select {
 				case c.incomingStreams <- stream:
 				default:
-					// صف استریم‌های ورودی پر است
 					continue
 				}
 			}
@@ -302,25 +354,19 @@ func (c *Connection) readLoop() {
 				Version:    ProtocolVersion,
 				Type:       PacketTypeAck,
 				StreamID:   header.StreamID,
-				Sequence:   header.Sequence, // تایید همین Sequence دریافتی
+				Sequence:   header.Sequence,
 				Timestamp:  time.Now().UnixNano(),
 				WindowSize: uint16(stream.recvWindow.Load()),
 			}
 			c.sendPacket(ackHeader, nil)
 
-			// قرار دادن داده در بافر دریافت استریم
+			// ارسال دیتا به استریم جهت مرتب‌سازی و ذخیره
 			if !stream.closed.Load() && len(payload) > 0 {
-				select {
-				case stream.recvBuf <- payload:
-					stream.recvWindow.Add(^uint32(0)) // کاهش ظرفیت بافر دریافت
-				default:
-					// دراپ کردن بسته اگر بافر پر است
-				}
+				stream.HandleIncomingData(header.Sequence, payload)
 			}
 
 		case PacketTypeAck:
 			if exists {
-				// فرستنده ACK را دریافت کرده است
 				stream.HandleAck(header.Sequence, header.WindowSize)
 			}
 
@@ -335,7 +381,6 @@ func (c *Connection) readLoop() {
 	}
 }
 
-// AcceptStream برای گرفتن استریم‌های جدید ساخته شده توسط کلاینت
 func (c *Connection) AcceptStream() (*Stream, error) {
 	if c.closed.Load() {
 		return nil, ErrConnClosed
@@ -347,18 +392,17 @@ func (c *Connection) AcceptStream() (*Stream, error) {
 	return stream, nil
 }
 
-// OpenStream برای کلاینت جهت باز کردن یک استریم جدید
 func (c *Connection) OpenStream() (*Stream, error) {
 	if c.closed.Load() {
 		return nil, ErrConnClosed
 	}
 	id := c.nextID.Add(1)
 	stream := newStream(id, c)
-	
+
 	c.mu.Lock()
 	c.streams[id] = stream
 	c.mu.Unlock()
-	
+
 	return stream, nil
 }
 
@@ -366,14 +410,14 @@ func (c *Connection) Close() error {
 	if c.closed.Swap(true) {
 		return ErrConnClosed
 	}
-	
+
 	c.mu.Lock()
 	for _, s := range c.streams {
 		s.Close()
 	}
 	c.streams = make(map[uint32]*Stream)
 	c.mu.Unlock()
-	
+
 	close(c.incomingStreams)
 	return nil
 }
