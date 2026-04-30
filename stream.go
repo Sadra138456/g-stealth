@@ -1,4 +1,4 @@
-package main // در صورتی که پکیج شما نام دیگری دارد، آن را تغییر دهید
+package main
 
 import (
 	"errors"
@@ -7,24 +7,47 @@ import (
 	"time"
 )
 
+// فرض بر این است که این ثابت‌ها در protocol.go تعریف شده‌اند. 
+// اگر نام آن‌ها متفاوت است، لطفاً نام‌ها را مطابق با protocol.go تغییر دهید.
+const (
+	PacketTypeStreamData = 1
+	PacketTypeAck        = 2
+	PacketTypeClose      = 3
+	// ProtocolVersion = 1 // فرض بر وجود در protocol.go
+)
+
 var (
 	ErrStreamClosed   = errors.New("stream closed")
 	ErrWindowFull     = errors.New("send window is full")
+	ErrConnClosed     = errors.New("connection closed")
 	ConnectionTimeout = 30 * time.Second
 )
 
-// ساختار برای نگهداری بسته‌هایی که هنوز ACK آن‌ها دریافت نشده است
+// =================================================================
+// ساختارهای کنترل ارسال مجدد و ازدحام
+// =================================================================
+
 type unackedPacket struct {
-	header []byte
-	data   []byte
-	sentAt time.Time
-	seq    uint32
+	data    []byte
+	sentAt  time.Time
+	seq     uint32
 	retries int
 }
 
-// -----------------------------------------------------------------
-// ساختار استریم (Stream)
-// -----------------------------------------------------------------
+type CongestionControl struct {
+	window   atomic.Uint32
+	ssthresh atomic.Uint32
+	rtt      atomic.Int64
+	rttVar   atomic.Int64
+	inFlight atomic.Uint32
+	lastAck  atomic.Int64
+	mu       sync.Mutex
+}
+
+// =================================================================
+// مدیریت استریم (Stream)
+// =================================================================
+
 type Stream struct {
 	id         uint32
 	conn       *Connection
@@ -38,7 +61,6 @@ type Stream struct {
 	recvBuf chan []byte
 	mu      sync.Mutex
 
-	// فیلدهای کنترل ارسال مجدد
 	unacked   map[uint32]*unackedPacket
 	unackedMu sync.Mutex
 }
@@ -52,34 +74,26 @@ func newStream(id uint32, conn *Connection) *Stream {
 		unacked: make(map[uint32]*unackedPacket),
 	}
 	
-	s.sendWindow.Store(1024) // ظرفیت اولیه پنجره ارسال
-	s.recvWindow.Store(1024) // ظرفیت اولیه پنجره دریافت
+	s.sendWindow.Store(1024)
+	s.recvWindow.Store(1024)
 
-	// شروع حلقه مانیتورینگ برای ارسال مجدد در پس‌زمینه
+	// اجرای حلقه مانیتورینگ برای ارسال مجدد بسته‌های تاییدنشده
 	go s.retransmitLoop()
 
 	return s
 }
-
-// -----------------------------------------------------------------
-// توابع اصلی استریم (Write, Read, Close)
-// -----------------------------------------------------------------
 
 func (s *Stream) Write(p []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, ErrStreamClosed
 	}
 
-	// کنترل جریان: اگر پنجره ارسال پر شده باشد، منتظر می‌مانیم یا خطا می‌دهیم
-	// در یک پیاده‌سازی پیشرفته‌تر، اینجا باید از channel برای بلاک کردن استفاده شود
 	if s.sendWindow.Load() == 0 {
-		return 0, ErrWindowFull
+		return 0, ErrWindowFull // در سیستم‌های پیشرفته اینجا باید بلاک شود تا پنجره باز شود
 	}
 
 	seq := s.sendSeq.Add(1)
 
-	// ساخت هدر (باید مطابق با ساختار protocol.go شما باشد)
-	// فرض بر این است که PacketHeader در protocol.go تعریف شده است
 	header := &PacketHeader{
 		Version:    ProtocolVersion, 
 		Type:       PacketTypeStreamData, 
@@ -89,14 +103,12 @@ func (s *Stream) Write(p []byte) (int, error) {
 		WindowSize: uint16(s.recvWindow.Load()),
 	}
 
-	// کپی کردن داده‌ها برای جلوگیری از تغییر ناخواسته توسط لایه‌های بالاتر
 	dataCopy := make([]byte, len(p))
 	copy(dataCopy, p)
 
-	// ذخیره بسته در لیست بسته‌های در انتظار ACK
+	// ثبت بسته برای پیگیری ACK
 	s.unackedMu.Lock()
 	s.unacked[seq] = &unackedPacket{
-		header:  nil, // اگر متد header.Bytes() دارید اینجا قرار دهید
 		data:    dataCopy,
 		sentAt:  time.Now(),
 		seq:     seq,
@@ -104,10 +116,8 @@ func (s *Stream) Write(p []byte) (int, error) {
 	}
 	s.unackedMu.Unlock()
 
-	// کاهش ظرفیت پنجره ارسال به اندازه 1
-	s.sendWindow.Add(^uint32(0)) 
+	s.sendWindow.Add(^uint32(0)) // کاهش ظرفیت پنجره به اندازه ۱ واحد
 
-	// ارسال بسته به لایه Connection
 	err := s.conn.sendPacket(header, dataCopy)
 	if err != nil {
 		return 0, err
@@ -127,12 +137,8 @@ func (s *Stream) Read(p []byte) (int, error) {
 			return 0, ErrStreamClosed
 		}
 		
-		// کپی داده‌های دریافت شده به بافر کاربر
 		n := copy(p, data)
-		
-		// باز کردن فضای پنجره دریافت پس از خواندن برنامه
-		s.recvWindow.Add(1) 
-		
+		s.recvWindow.Add(1) // آزادسازی ظرفیت بافر دریافت
 		return n, nil
 		
 	case <-time.After(ConnectionTimeout):
@@ -148,33 +154,35 @@ func (s *Stream) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// بستن کانال‌ها به صورت امن
 	close(s.sendBuf)
 	close(s.recvBuf)
 
-	// پاکسازی لیست Unacked
 	s.unackedMu.Lock()
 	s.unacked = make(map[uint32]*unackedPacket)
 	s.unackedMu.Unlock()
 
+	// ارسال پکت بستن استریم به سمت مقابل
+	header := &PacketHeader{
+		Version:   ProtocolVersion,
+		Type:      PacketTypeClose,
+		StreamID:  s.id,
+		Sequence:  s.sendSeq.Add(1),
+		Timestamp: time.Now().UnixNano(),
+	}
+	s.conn.sendPacket(header, nil)
+
 	return nil
 }
 
-// -----------------------------------------------------------------
-// توابع مدیریت قابلیت اطمینان (ACK و Retransmission)
-// -----------------------------------------------------------------
-
-// HandleAck توسط Connection فراخوانی می‌شود وقتی پکت ACK برای این استریم می‌رسد
 func (s *Stream) HandleAck(ackSeq uint32, windowSize uint16) {
 	s.unackedMu.Lock()
 	defer s.unackedMu.Unlock()
 
 	if _, exists := s.unacked[ackSeq]; exists {
-		delete(s.unacked, ackSeq) // حذف بسته تایید شده
-		s.sendWindow.Add(1)       // افزایش ظرفیت پنجره ارسال
+		delete(s.unacked, ackSeq)
+		s.sendWindow.Add(1)
 	}
 
-	// به‌روزرسانی پنجره ارسال با توجه به ظرفیت اعلام شده گیرنده
 	s.sendWindow.Store(uint32(windowSize))
 }
 
@@ -182,7 +190,7 @@ func (s *Stream) retransmitLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	timeout := 400 * time.Millisecond // زمان انتظار قبل از ارسال مجدد
+	timeout := 400 * time.Millisecond
 
 	for range ticker.C {
 		if s.closed.Load() {
@@ -195,7 +203,7 @@ func (s *Stream) retransmitLoop() {
 		for seq, pkt := range s.unacked {
 			if now.Sub(pkt.sentAt) > timeout {
 				if pkt.retries >= 5 {
-					// اگر ۵ بار تلاش کردیم و جواب نیامد، استریم قطع می‌شود
+					// قطع استریم در صورت عدم دریافت ACK پس از ۵ تلاش
 					s.unackedMu.Unlock()
 					s.Close()
 					return
@@ -204,7 +212,6 @@ func (s *Stream) retransmitLoop() {
 				pkt.retries++
 				pkt.sentAt = now
 				
-				// ساخت مجدد هدر برای ارسال مجدد (جهت آپدیت تایم‌استمپ)
 				header := &PacketHeader{
 					Version:    ProtocolVersion, 
 					Type:       PacketTypeStreamData, 
@@ -214,7 +221,6 @@ func (s *Stream) retransmitLoop() {
 					WindowSize: uint16(s.recvWindow.Load()),
 				}
 
-				// ارسال مجدد بدون بلاک کردن در صورت امکان
 				go s.conn.sendPacket(header, pkt.data)
 			}
 		}
@@ -222,12 +228,12 @@ func (s *Stream) retransmitLoop() {
 	}
 }
 
-// -----------------------------------------------------------------
-// ساختارهای اتصال و کنترل ازدحام
-// -----------------------------------------------------------------
+// =================================================================
+// مدیریت اتصال (Connection و Demultiplexer)
+// =================================================================
 
 type Connection struct {
-	transport       *SpaceShuttleConn // تعریف شده در protocol.go
+	transport       *SpaceShuttleConn // فرض بر وجود SpaceShuttleConn در protocol.go
 	streams         map[uint32]*Stream
 	nextID          atomic.Uint32
 	closed          atomic.Bool
@@ -236,19 +242,138 @@ type Connection struct {
 	incomingStreams chan *Stream
 }
 
-// متدهای مرتبط با Connection (مانند sendPacket) اینجا قرار می‌گیرند...
-func (c *Connection) sendPacket(header *PacketHeader, payload []byte) error {
-	// پیاده‌سازی اتصال به transport.SendPacket
-	// ...
-	return nil
+func NewConnection(transport *SpaceShuttleConn) *Connection {
+	c := &Connection{
+		transport:       transport,
+		streams:         make(map[uint32]*Stream),
+		incomingStreams: make(chan *Stream, 128),
+		congestion:      &CongestionControl{},
+	}
+	
+	// شروع گوش دادن به پکت‌های ورودی از شبکه
+	go c.readLoop()
+	return c
 }
 
-type CongestionControl struct {
-	window   atomic.Uint32
-	ssthresh atomic.Uint32
-	rtt      atomic.Int64
-	rttVar   atomic.Int64
-	inFlight atomic.Uint32
-	lastAck  atomic.Int64
-	mu       sync.Mutex
+func (c *Connection) sendPacket(header *PacketHeader, payload []byte) error {
+	if c.closed.Load() {
+		return ErrConnClosed
+	}
+	// فرض بر این است که SendPacket در protocol.go پیاده‌سازی شده و هدر و پی‌لود را می‌گیرد
+	return c.transport.SendPacket(header, payload)
+}
+
+// readLoop پکت‌ها را از لایه Transport می‌خواند و به استریم مناسب هدایت می‌کند (Demultiplexing)
+func (c *Connection) readLoop() {
+	for {
+		if c.closed.Load() {
+			return
+		}
+
+		// فرض می‌کنیم RecvPacket در protocol.go هدر و داده را برمی‌گرداند
+		header, payload, err := c.transport.RecvPacket()
+		if err != nil {
+			continue // در حالت واقعی ممکن است بخواهید خطا را مدیریت کنید یا کانکشن را ببندید
+		}
+
+		c.mu.RLock()
+		stream, exists := c.streams[header.StreamID]
+		c.mu.RUnlock()
+
+		switch header.Type {
+		case PacketTypeStreamData:
+			if !exists {
+				// ایجاد استریم جدید در صورت عدم وجود (مناسب برای سرور)
+				stream = newStream(header.StreamID, c)
+				c.mu.Lock()
+				c.streams[header.StreamID] = stream
+				c.mu.Unlock()
+				
+				select {
+				case c.incomingStreams <- stream:
+				default:
+					// صف استریم‌های ورودی پر است
+					continue
+				}
+			}
+
+			// ارسال خودکار پکت ACK به فرستنده
+			ackHeader := &PacketHeader{
+				Version:    ProtocolVersion,
+				Type:       PacketTypeAck,
+				StreamID:   header.StreamID,
+				Sequence:   header.Sequence, // تایید همین Sequence دریافتی
+				Timestamp:  time.Now().UnixNano(),
+				WindowSize: uint16(stream.recvWindow.Load()),
+			}
+			c.sendPacket(ackHeader, nil)
+
+			// قرار دادن داده در بافر دریافت استریم
+			if !stream.closed.Load() && len(payload) > 0 {
+				select {
+				case stream.recvBuf <- payload:
+					stream.recvWindow.Add(^uint32(0)) // کاهش ظرفیت بافر دریافت
+				default:
+					// دراپ کردن بسته اگر بافر پر است
+				}
+			}
+
+		case PacketTypeAck:
+			if exists {
+				// فرستنده ACK را دریافت کرده است
+				stream.HandleAck(header.Sequence, header.WindowSize)
+			}
+
+		case PacketTypeClose:
+			if exists {
+				stream.Close()
+				c.mu.Lock()
+				delete(c.streams, header.StreamID)
+				c.mu.Unlock()
+			}
+		}
+	}
+}
+
+// AcceptStream برای گرفتن استریم‌های جدید ساخته شده توسط کلاینت
+func (c *Connection) AcceptStream() (*Stream, error) {
+	if c.closed.Load() {
+		return nil, ErrConnClosed
+	}
+	stream, ok := <-c.incomingStreams
+	if !ok {
+		return nil, ErrConnClosed
+	}
+	return stream, nil
+}
+
+// OpenStream برای کلاینت جهت باز کردن یک استریم جدید
+func (c *Connection) OpenStream() (*Stream, error) {
+	if c.closed.Load() {
+		return nil, ErrConnClosed
+	}
+	id := c.nextID.Add(1)
+	stream := newStream(id, c)
+	
+	c.mu.Lock()
+	c.streams[id] = stream
+	c.mu.Unlock()
+	
+	return stream, nil
+}
+
+func (c *Connection) Close() error {
+	if c.closed.Swap(true) {
+		return ErrConnClosed
+	}
+	
+	c.mu.Lock()
+	for _, s := range c.streams {
+		s.Close()
+	}
+	c.streams = make(map[uint32]*Stream)
+	c.mu.Unlock()
+	
+	close(c.incomingStreams)
+	return nil
 }
